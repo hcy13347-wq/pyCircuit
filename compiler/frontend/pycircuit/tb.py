@@ -176,6 +176,111 @@ class PrintAction:
     every: int | None = None
 
 
+@dataclass(frozen=True)
+class GeneratedReadyValidWorkload:
+    source_valid: str
+    source_payload: str
+    source_ready: str
+    sink_valid: str
+    sink_payload: str
+    sink_ready: str
+    count: int
+    data_width: int
+    start_cycle: int = 1
+    generator_id: str = "lcg_payload_v0"
+    seed: int = 0
+    multiplier: int = 0x45D9F3B
+    ready_period: int = 0
+    ready_stall: int = 0
+
+
+@dataclass(frozen=True)
+class InstructionStreamSpec:
+    name: str
+    words: tuple[int, ...]
+    word_bits: int = 32
+    isa: str = "raw"
+    encoding: str = "raw_le32_inline"
+    source: str = ""
+    issue_protocol: str = "cmd"
+    flags: int = 0
+
+
+@dataclass(frozen=True)
+class ExternalWorkloadSpec:
+    name: str
+    path: str
+    format: str
+    word_bits: int = 32
+    count: int = 0
+    chunk_size: int = 4096
+    sha256: str = ""
+    issue_protocol: str = "cmd"
+    offset: int = 0
+    byte_size: int = 0
+    flags: int = 0
+
+
+@dataclass(frozen=True)
+class ScoreboardPolicySpec:
+    name: str
+    policy: str
+    target: str = ""
+    reference: str = ""
+    signature: str = ""
+    sample_period: int = 0
+    max_mismatches: int = 0
+    flags: int = 0
+
+
+class ReadyValidSourceBuilder:
+    def __init__(self, tb: "Tb", *, name: str, valid: str, ready: str, payload: str) -> None:
+        self._tb = tb
+        self.name = str(name)
+        self.valid = str(valid)
+        self.ready = str(ready)
+        self.payload = str(payload)
+        self._transactions: list[int] = []
+
+    def send(self, value: int | bool) -> None:
+        if not isinstance(value, (bool, int)):
+            raise TbError("ready_valid_source.send value must be bool or int")
+        self._transactions.append(int(value))
+
+    @property
+    def transactions(self) -> tuple[int, ...]:
+        return tuple(self._transactions)
+
+
+class ReadyValidSinkBuilder:
+    def __init__(self, tb: "Tb", *, name: str, valid: str, ready: str, payload: str) -> None:
+        self._tb = tb
+        self.name = str(name)
+        self.valid = str(valid)
+        self.ready = str(ready)
+        self.payload = str(payload)
+        self._expected: list[int] = []
+        self.ready_period = 0
+        self.ready_stall = 0
+
+    def expect(self, value: int | bool) -> None:
+        if not isinstance(value, (bool, int)):
+            raise TbError("ready_valid_sink.expect value must be bool or int")
+        self._expected.append(int(value))
+
+    def backpressure(self, *, period: int, stall: int) -> None:
+        p = int(period)
+        s = int(stall)
+        if p < 0 or s < 0 or (p > 0 and s >= p):
+            raise TbError("ready_valid_sink.backpressure requires 0 <= stall < period")
+        self.ready_period = p
+        self.ready_stall = s
+
+    @property
+    def expected(self) -> tuple[int, ...]:
+        return tuple(self._expected)
+
+
 @dataclass
 class Tb:
     """A tiny, cycle-based testbench description (prototype).
@@ -191,6 +296,12 @@ class Tb:
     sva_asserts: list[SvaAssert] = field(default_factory=list)
     random_streams: list[RandomStream] = field(default_factory=list)
     prints: list[PrintAction] = field(default_factory=list)
+    generated_ready_valid_workloads: list[GeneratedReadyValidWorkload] = field(default_factory=list)
+    ready_valid_sources: list[ReadyValidSourceBuilder] = field(default_factory=list)
+    ready_valid_sinks: list[ReadyValidSinkBuilder] = field(default_factory=list)
+    instruction_streams: list[InstructionStreamSpec] = field(default_factory=list)
+    external_workloads: list[ExternalWorkloadSpec] = field(default_factory=list)
+    scoreboard_policies: list[ScoreboardPolicySpec] = field(default_factory=list)
 
     timeout_cycles: int = 1000
     finish_cycle: int | None = None
@@ -299,6 +410,193 @@ class Tb:
         if ev <= 0:
             raise TbError("random every must be > 0")
         self.random_streams.append(RandomStream(port=p, seed=int(seed), start=st, every=ev))
+
+    def generated_ready_valid(
+        self,
+        *,
+        source_valid: str,
+        source_payload: str,
+        source_ready: str,
+        sink_valid: str,
+        sink_payload: str,
+        sink_ready: str,
+        count: int,
+        data_width: int,
+        start_cycle: int = 1,
+        generator_id: str = "lcg_payload_v0",
+        seed: int = 0,
+        multiplier: int = 0x45D9F3B,
+        ready_period: int = 0,
+        ready_stall: int = 0,
+    ) -> None:
+        """Attach an experimental generated ready-valid workload.
+
+        This is software testbench metadata, not hardware. It lets scalable
+        testbenches describe long protocol workloads without expanding every
+        cycle into `drive` and `expect` rows.
+        """
+
+        names = [source_valid, source_payload, source_ready, sink_valid, sink_payload, sink_ready]
+        if any(not str(name).strip() for name in names):
+            raise TbError("generated_ready_valid ports must be non-empty")
+        n = int(count)
+        if n < 0:
+            raise TbError("generated_ready_valid count must be >= 0")
+        width = int(data_width)
+        if width <= 0 or width > 64:
+            raise TbError("generated_ready_valid data_width must be in 1..64")
+        start = int(start_cycle)
+        if start < 0:
+            raise TbError("generated_ready_valid start_cycle must be >= 0")
+        period = int(ready_period)
+        stall = int(ready_stall)
+        if period < 0 or stall < 0 or (period > 0 and stall >= period):
+            raise TbError("generated_ready_valid ready pattern requires 0 <= stall < period")
+        self.generated_ready_valid_workloads.append(
+            GeneratedReadyValidWorkload(
+                source_valid=str(source_valid).strip(),
+                source_payload=str(source_payload).strip(),
+                source_ready=str(source_ready).strip(),
+                sink_valid=str(sink_valid).strip(),
+                sink_payload=str(sink_payload).strip(),
+                sink_ready=str(sink_ready).strip(),
+                count=n,
+                data_width=width,
+                start_cycle=start,
+                generator_id=str(generator_id),
+                seed=int(seed),
+                multiplier=int(multiplier),
+                ready_period=period,
+                ready_stall=stall,
+            )
+        )
+
+    def ready_valid_source(self, *, name: str, valid: str, ready: str, payload: str) -> ReadyValidSourceBuilder:
+        if not str(name).strip():
+            raise TbError("ready_valid_source name must be non-empty")
+        builder = ReadyValidSourceBuilder(self, name=name, valid=valid, ready=ready, payload=payload)
+        self.ready_valid_sources.append(builder)
+        return builder
+
+    def ready_valid_sink(self, *, name: str, valid: str, ready: str, payload: str) -> ReadyValidSinkBuilder:
+        if not str(name).strip():
+            raise TbError("ready_valid_sink name must be non-empty")
+        builder = ReadyValidSinkBuilder(self, name=name, valid=valid, ready=ready, payload=payload)
+        self.ready_valid_sinks.append(builder)
+        return builder
+
+    def instruction_stream(
+        self,
+        *,
+        name: str,
+        words: Iterable[int],
+        word_bits: int = 32,
+        isa: str = "raw",
+        encoding: str = "raw_le32_inline",
+        source: str = "",
+        issue_protocol: str = "cmd",
+        flags: int = 0,
+    ) -> None:
+        if not str(name).strip():
+            raise TbError("instruction_stream name must be non-empty")
+        width = int(word_bits)
+        if width <= 0 or width > 64:
+            raise TbError("instruction_stream word_bits must be in 1..64")
+        self.instruction_streams.append(
+            InstructionStreamSpec(
+                name=str(name).strip(),
+                words=tuple(int(word) for word in words),
+                word_bits=width,
+                isa=str(isa),
+                encoding=str(encoding),
+                source=str(source),
+                issue_protocol=str(issue_protocol),
+                flags=int(flags),
+            )
+        )
+
+    def external_workload(
+        self,
+        *,
+        name: str,
+        path: str,
+        format: str,
+        word_bits: int = 32,
+        count: int = 0,
+        chunk_size: int = 4096,
+        sha256: str = "",
+        issue_protocol: str = "cmd",
+        offset: int = 0,
+        byte_size: int = 0,
+        flags: int = 0,
+    ) -> None:
+        if not str(name).strip():
+            raise TbError("external_workload name must be non-empty")
+        if not str(path).strip():
+            raise TbError("external_workload path must be non-empty")
+        if not str(format).strip():
+            raise TbError("external_workload format must be non-empty")
+        width = int(word_bits)
+        if width <= 0 or width > 64:
+            raise TbError("external_workload word_bits must be in 1..64")
+        n = int(count)
+        if n < 0:
+            raise TbError("external_workload count must be >= 0")
+        chunk = int(chunk_size)
+        if chunk <= 0:
+            raise TbError("external_workload chunk_size must be > 0")
+        off = int(offset)
+        size = int(byte_size)
+        if off < 0 or size < 0:
+            raise TbError("external_workload offset and byte_size must be >= 0")
+        self.external_workloads.append(
+            ExternalWorkloadSpec(
+                name=str(name).strip(),
+                path=str(path).strip(),
+                format=str(format).strip(),
+                word_bits=width,
+                count=n,
+                chunk_size=chunk,
+                sha256=str(sha256),
+                issue_protocol=str(issue_protocol),
+                offset=off,
+                byte_size=size,
+                flags=int(flags),
+            )
+        )
+
+    def expect_policy(
+        self,
+        *,
+        name: str,
+        policy: str,
+        target: str = "",
+        reference: str = "",
+        signature: str = "",
+        sample_period: int = 0,
+        max_mismatches: int = 0,
+        flags: int = 0,
+    ) -> None:
+        if not str(name).strip():
+            raise TbError("expect_policy name must be non-empty")
+        if not str(policy).strip():
+            raise TbError("expect_policy policy must be non-empty")
+        sample = int(sample_period)
+        mismatches = int(max_mismatches)
+        if sample < 0 or mismatches < 0:
+            raise TbError("expect_policy sample_period and max_mismatches must be >= 0")
+        self.scoreboard_policies.append(
+            ScoreboardPolicySpec(
+                name=str(name).strip(),
+                policy=str(policy).strip(),
+                target=str(target),
+                reference=str(reference),
+                signature=str(signature),
+                sample_period=sample,
+                max_mismatches=mismatches,
+                flags=int(flags),
+            )
+        )
 
     def print(self, fmt: str, *, at: int, ports: Iterable[str] = ()) -> None:
         s = str(fmt)

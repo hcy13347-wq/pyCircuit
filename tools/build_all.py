@@ -106,6 +106,45 @@ def build_one(
         return name, False, str(e)[:300]
 
 
+def smoke_tests() -> list[dict]:
+    return [
+        {
+            "name": "bypass_unit_v5_tb",
+            "cmd": [sys.executable, "designs/BypassUnit/tb_bypass_unit.py"],
+            "cwd": REPO,
+            "env": {
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONPATH": "compiler/frontend:designs:.",
+            },
+            "timeout_s": 120,
+        },
+    ]
+
+
+def run_smoke_test(spec: dict) -> tuple[str, bool, str]:
+    name = spec["name"]
+    env = os.environ.copy()
+    env.update(spec.get("env", {}))
+
+    try:
+        result = subprocess.run(
+            spec["cmd"],
+            cwd=spec.get("cwd", REPO),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=spec.get("timeout_s", 120),
+        )
+    except subprocess.TimeoutExpired:
+        return name, False, f"timeout after {spec.get('timeout_s', 120)}s"
+
+    if result.returncode == 0:
+        return name, True, "exit 0"
+
+    output = (result.stderr or result.stdout).strip()
+    return name, False, output[-300:]
+
+
 # ── Design Registry ──────────────────────────────────────────────────────
 
 def all_designs() -> list[dict]:
@@ -171,7 +210,7 @@ def all_designs() -> list[dict]:
     designs.append({
         "name": "bypass_unit",
         "module": "designs.BypassUnit.bypass_unit_v5",
-        "fn": "bypass_unit",
+        "fn": "build",
         "kwargs": {"lanes": 4, "data_width": 32, "ptag_count": 64, "ptype_count": 4},
         "out_dir": "designs/BypassUnit/build",
     })
@@ -277,40 +316,69 @@ def main() -> int:
     parser.add_argument("--filter", help="Only build designs matching this pattern")
     parser.add_argument("--logic-depth", type=int, default=256)
     parser.add_argument("--list", action="store_true")
+    parser.add_argument("--run-smoke-tests", action="store_true")
+    parser.add_argument("--smoke-only", action="store_true")
     args = parser.parse_args()
 
     designs = all_designs()
+    smoke = smoke_tests()
     if args.filter:
         designs = [d for d in designs if args.filter in d["name"]]
+        smoke = [s for s in smoke if args.filter in s["name"]]
 
     if args.list:
-        for d in designs:
-            print(f"  {d['name']:25s} {d['module']}::{d['fn']} -> {d['out_dir']}")
-        print(f"\nTotal: {len(designs)} designs")
+        if not args.smoke_only:
+            for d in designs:
+                print(f"  {d['name']:25s} {d['module']}::{d['fn']} -> {d['out_dir']}")
+            print(f"\nTotal: {len(designs)} designs")
+        if args.run_smoke_tests or args.smoke_only:
+            print("\nSmoke tests:")
+            for s in smoke:
+                print(f"  {s['name']:25s} {' '.join(s['cmd'])}")
+            print(f"\nTotal: {len(smoke)} smoke tests")
         return 0
 
-    pycc = find_pycc()
-    print(f"pycc: {pycc}")
-    print(f"Designs: {len(designs)}")
+    pycc = None if args.smoke_only else find_pycc()
+    if pycc is not None:
+        print(f"pycc: {pycc}")
+        print(f"Designs: {len(designs)}")
+    if args.run_smoke_tests or args.smoke_only:
+        print(f"Smoke tests: {len(smoke)}")
     print()
 
     succeeded = []
     failed = []
     t0 = time.time()
 
-    for i, spec in enumerate(designs, 1):
-        name = spec["name"]
-        print(f"[{i:2d}/{len(designs)}] {name:25s} ... ", end="", flush=True)
-        t1 = time.time()
-        name, ok, msg = build_one(spec, pycc, args.logic_depth)
-        dt = time.time() - t1
-        if ok:
-            print(f"OK  ({msg}, {dt:.1f}s)")
-            succeeded.append(name)
-        else:
-            print(f"FAIL ({dt:.1f}s)")
-            print(f"       {msg}")
-            failed.append((name, msg))
+    if not args.smoke_only:
+        for i, spec in enumerate(designs, 1):
+            name = spec["name"]
+            print(f"[{i:2d}/{len(designs)}] {name:25s} ... ", end="", flush=True)
+            t1 = time.time()
+            name, ok, msg = build_one(spec, pycc, args.logic_depth)
+            dt = time.time() - t1
+            if ok:
+                print(f"OK  ({msg}, {dt:.1f}s)")
+                succeeded.append(name)
+            else:
+                print(f"FAIL ({dt:.1f}s)")
+                print(f"       {msg}")
+                failed.append((name, msg))
+
+    if args.run_smoke_tests or args.smoke_only:
+        for i, spec in enumerate(smoke, 1):
+            name = spec["name"]
+            print(f"[smoke {i:2d}/{len(smoke)}] {name:25s} ... ", end="", flush=True)
+            t1 = time.time()
+            name, ok, msg = run_smoke_test(spec)
+            dt = time.time() - t1
+            if ok:
+                print(f"OK  ({msg}, {dt:.1f}s)")
+                succeeded.append(name)
+            else:
+                print(f"FAIL ({dt:.1f}s)")
+                print(f"       {msg}")
+                failed.append((name, msg))
 
     total = time.time() - t0
     print(f"\n{'='*60}")

@@ -16,6 +16,30 @@ This page lists the active pyc4.0 development entrypoints and gate commands.
 - `bash flows/scripts/run_sims.sh`
 - `bash flows/scripts/run_sims_nightly.sh`
 
+## Python unit tests
+
+Use the repository-local virtual environment for Python tests so the system or
+conda Python environment is not modified:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install pytest
+```
+
+Run pytest from the repository root with the frontend and local IP library on
+`PYTHONPATH`:
+
+```bash
+PYTHONPATH=compiler/frontend:. .venv/bin/python -m pytest
+```
+
+To run a focused test file:
+
+```bash
+PYTHONPATH=compiler/frontend:. \
+  .venv/bin/python -m pytest designs/examples/lowp_alu/tests/test_lowp_reference.py -q
+```
+
 ## Repository layout
 
 pyCircuit is organized as follows:

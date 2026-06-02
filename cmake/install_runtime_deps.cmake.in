@@ -4,6 +4,11 @@ endif()
 
 set(_pyc_runtime_deps)
 set(_pyc_unresolved_deps)
+set(_pyc_runtime_dependency_dirs
+  "@PYC_LLVM_LIBRARY_DIRS@"
+  "@PYC_MLIR_LIBRARY_DIRS@"
+)
+list(REMOVE_ITEM _pyc_runtime_dependency_dirs "")
 set(_pyc_execs
   "${CMAKE_INSTALL_PREFIX}/@CMAKE_INSTALL_BINDIR@/pycc"
 )
@@ -13,6 +18,7 @@ endif()
 
 file(GET_RUNTIME_DEPENDENCIES
   EXECUTABLES ${_pyc_execs}
+  DIRECTORIES ${_pyc_runtime_dependency_dirs}
   RESOLVED_DEPENDENCIES_VAR _pyc_runtime_deps
   UNRESOLVED_DEPENDENCIES_VAR _pyc_unresolved_deps
   POST_EXCLUDE_REGEXES
