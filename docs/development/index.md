@@ -40,6 +40,17 @@ PYTHONPATH=compiler/frontend:. \
   .venv/bin/python -m pytest designs/examples/lowp_alu/tests/test_lowp_reference.py -q
 ```
 
+Focused PYCSTB4/runtime-loop smoke tests:
+
+```bash
+PYTHONPATH=compiler/frontend:. \
+  .venv/bin/python -m pytest tests/test_pycstb4_sections.py tests/test_tb_section_api.py -q
+```
+
+The PYCSTB4 tests are intentionally lightweight. They validate container
+round-trip metadata and TB DSL section recording without requiring the MLIR/C++
+backend toolchain.
+
 ## Repository layout
 
 pyCircuit is organized as follows:
@@ -65,6 +76,7 @@ pyCircuit
 - `docs/FRONTEND_API.md`
 - `docs/PyCircuit_V5_Spec.md`
 - `docs/TESTBENCH.md`
+- `docs/PYCSTB4_RUNTIME_LOOP.md`
 - `docs/IR_SPEC.md`
 - `docs/DIAGNOSTICS.md`
 - `designs/examples/README.md`
