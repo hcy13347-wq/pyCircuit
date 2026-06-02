@@ -271,8 +271,8 @@ class ReadyValidSinkBuilder:
     def backpressure(self, *, period: int, stall: int) -> None:
         p = int(period)
         s = int(stall)
-        if p < 0 or s < 0 or (p > 0 and s >= p):
-            raise TbError("ready_valid_sink.backpressure requires 0 <= stall < period")
+        if p < 0 or s < 0 or (p == 0 and s != 0) or (p > 0 and s >= p):
+            raise TbError("ready_valid_sink.backpressure requires period=0,stall=0 or 0 <= stall < period")
         self.ready_period = p
         self.ready_stall = s
 
@@ -450,8 +450,8 @@ class Tb:
             raise TbError("generated_ready_valid start_cycle must be >= 0")
         period = int(ready_period)
         stall = int(ready_stall)
-        if period < 0 or stall < 0 or (period > 0 and stall >= period):
-            raise TbError("generated_ready_valid ready pattern requires 0 <= stall < period")
+        if period < 0 or stall < 0 or (period == 0 and stall != 0) or (period > 0 and stall >= period):
+            raise TbError("generated_ready_valid ready pattern requires period=0,stall=0 or 0 <= stall < period")
         self.generated_ready_valid_workloads.append(
             GeneratedReadyValidWorkload(
                 source_valid=str(source_valid).strip(),
