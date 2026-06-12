@@ -14,7 +14,7 @@ import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from .api_contract import collect_local_python_graph, nearest_project_root, scan_file
 from .diagnostics import render_diagnostic
@@ -75,6 +75,24 @@ def _load_py_file(path: Path) -> object:
     sys.modules[spec.name] = m
     spec.loader.exec_module(m)
     return m
+
+
+def _resolve_build_source_args(args: argparse.Namespace) -> tuple[Path, Path, bool]:
+    positional = str(getattr(args, "python_file", "") or "").strip()
+    design_arg = str(getattr(args, "design", "") or "").strip()
+    tb_arg = str(getattr(args, "tb", "") or "").strip()
+
+    if design_arg or tb_arg:
+        if not design_arg or not tb_arg:
+            raise SystemExit("build with split inputs requires both --design and --tb")
+        if positional:
+            raise SystemExit("build accepts either a positional python_file or --design/--tb, not both")
+        return (Path(design_arg).resolve(), Path(tb_arg).resolve(), True)
+
+    if not positional:
+        raise SystemExit("build requires a python_file or both --design and --tb")
+    src = Path(positional).resolve()
+    return (src, src, False)
 
 
 def _resolve_emit_source(src_arg: str) -> tuple[Path | None, object]:
@@ -2614,7 +2632,8 @@ def _module_bases_from_manifest(manifest: Mapping[str, Any]) -> dict[str, list[s
 
 def _resolve_probe_outputs(
     *,
-    mod: object,
+    mod: object | None = None,
+    mods: Iterable[object] | None = None,
     manifest: Mapping[str, Any],
     probe_catalog_path: Path,
     out_dir: Path,
@@ -2639,11 +2658,17 @@ def _resolve_probe_outputs(
         seen_module_ids.add(mod_id)
         probe_modules.append(candidate)
 
-    add_probe_module(mod)
-    for value in vars(mod).values():
-        owner = inspect.getmodule(value) if callable(value) else None
-        if owner is not None:
-            add_probe_module(owner)
+    raw_mods: list[object] = []
+    if mods is not None:
+        raw_mods.extend(list(mods))
+    elif mod is not None:
+        raw_mods.append(mod)
+    for probe_root_mod in raw_mods:
+        add_probe_module(probe_root_mod)
+        for value in vars(probe_root_mod).values():
+            owner = inspect.getmodule(value) if callable(value) else None
+            if owner is not None:
+                add_probe_module(owner)
 
     seen_probe_fns: set[int] = set()
     probe_fns: list[Any] = []
@@ -2702,21 +2727,25 @@ def _resolve_probe_outputs(
 
 
 def _cmd_build(args: argparse.Namespace) -> int:
-    src = Path(args.python_file).resolve()
+    design_src, tb_src, split_inputs = _resolve_build_source_args(args)
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     cache_path = out_dir / ".build_cache.json"
     cache = _load_json(cache_path) if cache_path.is_file() else {"module_hashes": {}}
 
-    project_root = _project_root(src, project_root_override=args.project_root)
-    _scan_api_contract(src, project_root_override=str(project_root))
-    mod = _load_py_file(src)
-    if not hasattr(mod, "build") or not callable(getattr(mod, "build")):
-        raise SystemExit(f"{src} must define a pyCircuit entrypoint: `@module def build(m: Circuit, ...)`")
-    build = getattr(mod, "build")
+    design_project_root = _project_root(design_src, project_root_override=args.project_root)
+    tb_project_root = _project_root(tb_src, project_root_override=args.project_root)
+    _scan_api_contract(design_src, project_root_override=str(design_project_root))
+    if tb_src != design_src:
+        _scan_api_contract(tb_src, project_root_override=str(tb_project_root))
+    design_mod = _load_py_file(design_src)
+    tb_mod = design_mod if tb_src == design_src else _load_py_file(tb_src)
+    if not hasattr(design_mod, "build") or not callable(getattr(design_mod, "build")):
+        raise SystemExit(f"{design_src} must define a pyCircuit entrypoint: `@module def build(m: Circuit, ...)`")
+    build = getattr(design_mod, "build")
     jit_params = _collect_jit_params(build, overrides=list(getattr(args, "param", []) or []))
-    top_name = _top_name_for_build(src, build)
+    top_name = _top_name_for_build(design_src, build)
 
     from .design import canonical_params_json
 
@@ -2724,15 +2753,16 @@ def _cmd_build(args: argparse.Namespace) -> int:
         jit_params_json = canonical_params_json(jit_params, path="jit_params")
     except DesignError as e:
         raise SystemExit(f"JIT param canonicalization failed: {e}") from e
-    jit_inputs = {
-        "version": 1,
-        "entry_hash": _module_hash(src),
-        "deps_hash": _deps_hash(src, project_root=project_root),
+    design_cache_inputs = {
+        "version": 2,
+        "design_hash": _module_hash(design_src),
+        "design_deps_hash": _deps_hash(design_src, project_root=design_project_root),
+        "design_relpath": str(design_src.relative_to(design_project_root)) if design_src.is_relative_to(design_project_root) else str(design_src),
         "jit_params_json": jit_params_json,
         "top_name": top_name,
         "frontend_contract": FRONTEND_CONTRACT,
     }
-    jit_key = _canonical_hash(jit_inputs)
+    design_cache_key = _canonical_hash(design_cache_inputs)
 
     manifest_path = out_dir / "project_manifest.json"
     design: Design | None = None
@@ -2741,8 +2771,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
     design_pyc_path: Path
     iface: _TopIface
 
-    cached_key = str(cache.get("jit_cache_key", "")).strip()
-    cache_hit = cached_key == jit_key and manifest_path.is_file()
+    cached_key = str(cache.get("design_cache_key", cache.get("jit_cache_key", ""))).strip()
+    cache_hit = cached_key == design_cache_key and manifest_path.is_file()
     if cache_hit:
         try:
             manifest = _load_json(manifest_path)
@@ -2791,19 +2821,34 @@ def _cmd_build(args: argparse.Namespace) -> int:
         "--hierarchy-policy=strict",
     ]
 
-    build_flags = {
+    device_backend_flags = {
         "pycc": str(pycc.resolve()),
         "logic_depth": logic_depth,
-        "profile": str(args.profile),
         "pycc_build_profile": pycc_build_profile,
         "inline_policy": "off",
         "hierarchy_policy": "strict",
-        "target": target,
-        "tb_schedule_mode": str(args.tb_schedule_mode),
         "frontend_contract": FRONTEND_CONTRACT,
     }
+    device_backend_flags_hash = _canonical_hash(device_backend_flags)
+    same_device_flags = str(cache.get("device_backend_flags_hash", "")) == device_backend_flags_hash
+    tb_backend_flags = {
+        "pycc": str(pycc.resolve()),
+        "pycc_build_profile": pycc_build_profile,
+        "inline_policy": "off",
+        "hierarchy_policy": "strict",
+        "tb_schedule_mode": str(args.tb_schedule_mode),
+        "tb_schedule_format": str(args.tb_schedule_format),
+        "frontend_contract": FRONTEND_CONTRACT,
+    }
+    tb_backend_flags_hash = _canonical_hash(tb_backend_flags)
+    same_tb_flags = str(cache.get("tb_backend_flags_hash", "")) == tb_backend_flags_hash
+    build_flags = {
+        "device_backend_flags": device_backend_flags,
+        "tb_backend_flags": tb_backend_flags,
+        "profile": str(args.profile),
+        "target": target,
+    }
     build_flags_hash = _canonical_hash(build_flags)
-    same_flags = str(cache.get("build_flags_hash", "")) == build_flags_hash
 
     design_key = "__design_pyc"
     old_hashes = dict(cache.get("module_hashes", {}))
@@ -2812,8 +2857,9 @@ def _cmd_build(args: argparse.Namespace) -> int:
     module_hashes[design_key] = design_hash
     probe_catalog_path = out_dir / "device" / "probe_catalog.json"
     probe_catalog_ready = probe_catalog_path.is_file()
-    probe_unchanged = same_flags and old_hashes.get(design_key) == design_hash
+    probe_unchanged = same_device_flags and old_hashes.get(design_key) == design_hash
     pycc_jobs: list[tuple[str, list[str]]] = []
+    last_pycc_job_names: list[str] = []
     if not (probe_unchanged and probe_catalog_ready):
         pycc_jobs.append(
             (
@@ -2830,6 +2876,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
             )
         )
     if pycc_jobs:
+        last_pycc_job_names.extend(name for name, _cmd in pycc_jobs)
         with ProcessPoolExecutor(max_workers=jobs) as pool:
             futs = {pool.submit(_run_backend_job, j): j[0] for j in pycc_jobs}
             for fut in as_completed(futs):
@@ -2838,7 +2885,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
 
     try:
         probe_manifest_obj, probe_section, probe_plan_path = _resolve_probe_outputs(
-            mod=mod,
+            mods=[design_mod, tb_mod],
             manifest=manifest,
             probe_catalog_path=probe_catalog_path,
             out_dir=out_dir,
@@ -2868,7 +2915,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
 
     tb_probes = TbProbes.from_probe_manifest(probe_manifest_obj)
     tb_name, tb_payload_json = _collect_testbench_payload(
-        mod,
+        tb_mod,
         iface,
         trace_plan=trace_plan,
         tb_probes=tb_probes,
@@ -2885,15 +2932,27 @@ def _cmd_build(args: argparse.Namespace) -> int:
 
     tb_cpp_out = out_dir / "tb" / f"{tb_name}.cpp"
     tb_sv_out = out_dir / "tb" / f"{tb_name}.sv"
+    device_cpp_backend_flags = {
+        **device_backend_flags,
+        "probe_plan_hash": _module_hash(probe_plan_path),
+    }
+    device_cpp_backend_flags_hash = _canonical_hash(device_cpp_backend_flags)
+    same_device_cpp_flags = str(cache.get("device_cpp_backend_flags_hash", "")) == device_cpp_backend_flags_hash
+    device_verilog_backend_flags = dict(device_backend_flags)
+    device_verilog_backend_flags_hash = _canonical_hash(device_verilog_backend_flags)
+    same_device_verilog_flags = (
+        str(cache.get("device_verilog_backend_flags_hash", cache.get("device_backend_flags_hash", "")))
+        == device_verilog_backend_flags_hash
+    )
     for sym in sorted(module_paths.keys()):
         mp = module_paths[sym]
         h = _module_hash(mp)
         module_hashes[sym] = h
-        unchanged = same_flags and old_hashes.get(sym) == h
 
         cpp_out_dir = device_cpp_root / sym
         cpp_ready = cpp_out_dir.is_dir() and any(cpp_out_dir.glob("*.cpp")) and any(cpp_out_dir.glob("*.hpp"))
-        if do_cpp and not (unchanged and cpp_ready):
+        cpp_unchanged = same_device_cpp_flags and old_hashes.get(sym) == h
+        if do_cpp and not (cpp_unchanged and cpp_ready):
             cpp_out_dir.mkdir(parents=True, exist_ok=True)
             pycc_jobs.append(
                 (
@@ -2915,7 +2974,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
 
         verilog_out_dir = device_v_root / sym
         verilog_ready = verilog_out_dir.is_dir() and any(verilog_out_dir.glob("*.v"))
-        if do_v and not (unchanged and verilog_ready):
+        verilog_unchanged = same_device_verilog_flags and old_hashes.get(sym) == h
+        if do_v and not (verilog_unchanged and verilog_ready):
             verilog_out_dir.mkdir(parents=True, exist_ok=True)
             pycc_jobs.append(
                 (
@@ -2936,7 +2996,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
         tb_key = f"tb:{tb_name}"
         tb_hash = _module_hash(tb_pyc_path)
         module_hashes[tb_key] = tb_hash
-        tb_unchanged = same_flags and old_hashes.get(tb_key) == tb_hash
+        tb_unchanged = same_tb_flags and old_hashes.get(tb_key) == tb_hash
         if not (tb_unchanged and tb_cpp_out.is_file()):
             pycc_jobs.append(
                 (
@@ -2948,7 +3008,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
         tb_key = f"tb:{tb_name}"
         tb_hash = module_hashes.get(tb_key) or _module_hash(tb_pyc_path)
         module_hashes[tb_key] = tb_hash
-        tb_unchanged = same_flags and old_hashes.get(tb_key) == tb_hash
+        tb_unchanged = same_tb_flags and old_hashes.get(tb_key) == tb_hash
         if not (tb_unchanged and tb_sv_out.is_file()):
             pycc_jobs.append(
                 (
@@ -2958,6 +3018,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
             )
 
     if pycc_jobs:
+        last_pycc_job_names.extend(name for name, _cmd in pycc_jobs)
         with ProcessPoolExecutor(max_workers=jobs) as pool:
             futs = {pool.submit(_run_backend_job, j): j[0] for j in pycc_jobs}
             for fut in as_completed(futs):
@@ -3125,9 +3186,23 @@ def _cmd_build(args: argparse.Namespace) -> int:
             "pycc": str(pycc),
             "build_flags": build_flags,
             "build_flags_hash": build_flags_hash,
-            "jit_cache_key": jit_key,
-            "jit_cache_inputs": jit_inputs,
-            "last_pycc_jobs": int(len(pycc_jobs)),
+            "design_cache_key": design_cache_key,
+            "design_cache_inputs": design_cache_inputs,
+            "jit_cache_key": design_cache_key,
+            "jit_cache_inputs": design_cache_inputs,
+            "split_inputs": bool(split_inputs),
+            "design_src": str(design_src),
+            "tb_src": str(tb_src),
+            "device_backend_flags": device_backend_flags,
+            "device_backend_flags_hash": device_backend_flags_hash,
+            "device_cpp_backend_flags": device_cpp_backend_flags,
+            "device_cpp_backend_flags_hash": device_cpp_backend_flags_hash,
+            "device_verilog_backend_flags": device_verilog_backend_flags,
+            "device_verilog_backend_flags_hash": device_verilog_backend_flags_hash,
+            "tb_backend_flags": tb_backend_flags,
+            "tb_backend_flags_hash": tb_backend_flags_hash,
+            "last_pycc_jobs": int(len(last_pycc_job_names)),
+            "last_pycc_job_names": last_pycc_job_names,
         }
     )
     _save_json(cache_path, cache_out)
@@ -3262,7 +3337,21 @@ def main(argv: list[str] | None = None) -> int:
     emit.set_defaults(fn=_cmd_emit)
 
     build = sub.add_parser("build", help="Canonical flow: multi-.pyc emit + parallel pycc + CMake/Verilator.")
-    build.add_argument("python_file", help="Python source defining `@module build(...)` and `@testbench tb(...)`")
+    build.add_argument(
+        "python_file",
+        nargs="?",
+        help="Legacy single Python source defining/importing `@module build(...)` and `@testbench tb(...)`",
+    )
+    build.add_argument(
+        "--design",
+        default=None,
+        help="Design Python source defining `@module build(...)`; must be used with --tb.",
+    )
+    build.add_argument(
+        "--tb",
+        default=None,
+        help="Testbench Python source defining `@testbench tb(...)`; must be used with --design.",
+    )
     build.add_argument("--out-dir", required=True, help="Output directory for project artifacts")
     build.add_argument(
         "--param",

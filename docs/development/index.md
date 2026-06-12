@@ -8,6 +8,8 @@ This page lists the active pyc4.0 development entrypoints and gate commands.
 - `docs/updatePLAN.md`
 - `docs/gates/README.md`
 - `docs/gates/decision_status_v40.md`
+- `docs/development/split-design-tb-build.md`
+- `docs/development/split-design-tb-build-pr-summary.md`
 
 ## Build and gate commands
 

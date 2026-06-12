@@ -43,7 +43,14 @@ Emit a single `.pyc`:
 python3 -m pycircuit.cli emit <design.py> -o out.pyc
 ```
 
-Build a project (multi-module + testbench):
+Build a project with split design/TB inputs. This keeps the design frontend
+cache independent from TB-only edits:
+
+```bash
+python3 -m pycircuit.cli build --design <design.py> --tb <tb.py> --out-dir <dir> --target cpp|verilator|both --jobs <N>
+```
+
+The legacy single-file/project-entry form is still accepted:
 
 ```bash
 python3 -m pycircuit.cli build <tb_or_top.py> --out-dir <dir> --target cpp|verilator|both --jobs <N>
@@ -52,5 +59,5 @@ python3 -m pycircuit.cli build <tb_or_top.py> --out-dir <dir> --target cpp|veril
 Simulation (Verilator):
 
 ```bash
-python3 -m pycircuit.cli build <tb.py> --out-dir <dir> --target verilator --run-verilator
+python3 -m pycircuit.cli build --design <design.py> --tb <tb.py> --out-dir <dir> --target verilator --run-verilator
 ```
