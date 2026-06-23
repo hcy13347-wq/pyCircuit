@@ -2861,6 +2861,14 @@ def _cmd_build(args: argparse.Namespace) -> int:
     cache = _load_json(cache_path) if cache_path.is_file() else {"module_hashes": {}}
     manifest_path = out_dir / "project_manifest.json"
     param_overrides = list(getattr(args, "param", []) or [])
+    cached_param_overrides = list(cache.get("param_overrides", []) or [])
+    if tb_only:
+        if param_overrides and param_overrides != cached_param_overrides:
+            raise SystemExit(
+                "build --tb cannot change DUT --param overrides; "
+                "run `pycircuit build --dut <dut.py> --out-dir <dir> ...` first"
+            )
+        param_overrides = cached_param_overrides
     design_project_root = _project_root(design_src, project_root_override=args.project_root) if has_design else None
     tb_project_root = _project_root(tb_src, project_root_override=args.project_root) if has_tb else None
 

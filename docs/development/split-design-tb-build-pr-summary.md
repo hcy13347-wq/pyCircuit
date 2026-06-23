@@ -1,13 +1,13 @@
-# PR 说明：Design / Testbench 解耦构建
+# PR 说明：DUT / Testbench 解耦构建
 
 ## 完成状态
 
-本 PR 已完成 `pycircuit.cli build` 路径下的 design / testbench 解耦构建改造。
+本 PR 已完成 `pycircuit.cli build` 路径下的 DUT / testbench 解耦构建改造。
 
 这里的“完成”指的是：
 
-- design Python 入口和 TB Python 入口可以通过 CLI 显式拆开。
-- 只修改 TB 时，design JIT cache 不应失效。
+- DUT Python 入口和 TB Python 入口可以通过 CLI 显式拆开。
+- 只修改 TB 时，DUT JIT cache 不应失效。
 - 只修改 TB 时，不应重新生成 DUT C++。
 - 只修改 TB 时，不应重新编译 DUT object。
 - TB 修改后仍会重新生成/编译 TB，并 relink 最终仿真可执行文件。
@@ -27,7 +27,7 @@ target 中，但它们仍然作为不同的 C++ translation unit 分别编译成
 
 ```bash
 python3 -m pycircuit.cli build \
-  --design <design.py> \
+  --dut <dut.py> \
   --tb <tb.py> \
   --out-dir <dir> \
   --target cpp
@@ -41,9 +41,9 @@ python3 -m pycircuit.cli build <tb_or_top.py> --out-dir <dir>
 
 ## 主要改动
 
-- `build()` 只从 `--design` 模块读取。
+- `build()` 只从 `--dut` 模块读取。
 - `@testbench tb()` 只从 `--tb` 模块读取。
-- design cache key 与 TB backend cache key 分离。
+- DUT cache key 与 TB backend cache key 分离。
 - device C++、device Verilog、TB C++、TB SV 的 backend flag cache 分离。
 - probe 扫描同时覆盖 design module 和 TB module。
 - `.build_cache.json` 增加 `last_pycc_job_names`，用于验证本次增量构建行为。
@@ -53,7 +53,7 @@ python3 -m pycircuit.cli build <tb_or_top.py> --out-dir <dir>
 
 | 修改内容 | 期望行为 |
 | --- | --- |
-| 只改 TB | design cache hit；不重跑 DUT C++ 生成；不重编 DUT object；只重编 TB 并 relink |
+| 只改 TB | DUT cache hit；不重跑 DUT C++ 生成；不重编 DUT object；只重编 TB 并 relink |
 | 改 DUT 实现但接口不变 | 重新生成/编译 DUT；最终 relink |
 | 改 DUT 接口/header | DUT 和 TB 都按 C++ header 依赖重新编译 |
 | 改 runtime/common header | 依赖相关 header 的对象按 CMake/Ninja 依赖重新编译 |
@@ -71,7 +71,7 @@ git diff --check
 
 - 第一次 split build 生成 DUT/TB/CMake 产物。
 - 只修改 TB 文件。
-- 第二次 split build 命中 design cache。
+- 第二次 split build 命中 DUT cache。
 - `.build_cache.json` 中 `last_pycc_job_names` 只包含 `tb-cpp:*`。
 - DUT object mtime 不变。
 - TB object mtime 更新。
@@ -89,7 +89,7 @@ git diff --check
 | `compiler/frontend/pycircuit/cli.py` | `2824-2844` | 把 DUT 生成参数和 TB 生成参数分开记录，避免一边变化误伤另一边。 |
 | `compiler/frontend/pycircuit/cli.py` | `2933-3005` | 决定是否重跑代码生成时，DUT 和 TB 分开判断；只改 TB 时跳过 DUT 生成。 |
 | `compiler/frontend/pycircuit/cli.py` | `3182-3205` | 把本次构建实际重跑了哪些生成任务写进 cache，方便排查增量行为。 |
-| `compiler/frontend/pycircuit/cli.py` | `3339-3354` | 给 build 命令增加 `--design` 和 `--tb` 两个入口参数。 |
+| `compiler/frontend/pycircuit/cli.py` | `3339-3354` | 给 build 命令增加 `--dut` 和 `--tb` 两个入口参数。 |
 | `flows/tools/gen_cmake_from_manifest.py` | `73-79` | 这里说明最终仍是同一个仿真程序，但 DUT `.cpp` 和 TB `.cpp` 是分开编译的文件。 |
 | `tests/test_cli_split_build_incremental.py` | `137-170` | 测试里按新用法分别传入 DUT 文件和 TB 文件。 |
 | `tests/test_cli_split_build_incremental.py` | `180-250` | 测试只修改 TB 后，确认 DUT 没有重新编译，只有 TB 相关任务重跑。 |

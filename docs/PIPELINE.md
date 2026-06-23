@@ -43,11 +43,11 @@ Emit a single `.pyc`:
 python3 -m pycircuit.cli emit <design.py> -o out.pyc
 ```
 
-Build a project with split design/TB inputs. This keeps the design frontend
-cache independent from TB-only edits:
+Build a project with split DUT/TB inputs. This keeps the DUT frontend cache
+independent from TB-only edits:
 
 ```bash
-python3 -m pycircuit.cli build --design <design.py> --tb <tb.py> --out-dir <dir> --target cpp|verilator|both --jobs <N>
+python3 -m pycircuit.cli build --dut <dut.py> --tb <tb.py> --out-dir <dir> --target cpp|verilator|both --jobs <N>
 ```
 
 The legacy single-file/project-entry form is still accepted:
@@ -59,5 +59,5 @@ python3 -m pycircuit.cli build <tb_or_top.py> --out-dir <dir> --target cpp|veril
 Simulation (Verilator):
 
 ```bash
-python3 -m pycircuit.cli build --design <design.py> --tb <tb.py> --out-dir <dir> --target verilator --run-verilator
+python3 -m pycircuit.cli build --dut <dut.py> --tb <tb.py> --out-dir <dir> --target verilator --run-verilator
 ```

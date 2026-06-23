@@ -166,6 +166,7 @@ def _run_build_args(
     build_args: list[str],
     fake_pycc: Path,
     extra_env: dict[str, str] | None = None,
+    check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(repo / "compiler" / "frontend")
@@ -185,7 +186,7 @@ def _run_build_args(
         env=env,
         text=True,
         capture_output=True,
-        check=True,
+        check=check,
     )
 
 
@@ -335,6 +336,105 @@ def test_build_tb_only_reuses_design_cache_without_importing_dut(tmp_path: Path)
     assert cache["design_cache_fast_path"] is True
     assert cache["last_pycc_job_names"] == ["tb-cpp:tb_dut"]
     assert (out_dir / "tb" / "tb_dut.cpp").is_file()
+
+
+def test_build_tb_only_preserves_cached_dut_params(tmp_path: Path) -> None:
+    repo = Path(__file__).resolve().parents[1]
+    case_dir = tmp_path / "case"
+    case_dir.mkdir()
+    design = case_dir / "dut_design.py"
+    tb = case_dir / "dut_tb.py"
+    out_dir = tmp_path / "out"
+    fake_pycc = tmp_path / "fake_pycc.py"
+    _write_fake_pycc(fake_pycc)
+
+    design.write_text(
+        "\n".join(
+            [
+                "from pycircuit import Circuit, module, u",
+                "",
+                "@module",
+                "def build(m: Circuit, width: int = 8) -> None:",
+                "    x = m.input('x', width=width)",
+                "    m.output('y', x + u(width, 0))",
+                "",
+                "build.__pycircuit_name__ = 'dut'",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    tb.write_text(
+        "\n".join(
+            [
+                "from pycircuit import Tb, testbench",
+                "",
+                "@testbench",
+                "def tb(t: Tb) -> None:",
+                "    t.drive('x', 1, at=0)",
+                "    t.expect('y', 1, at=0)",
+                "    t.finish(at=1)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _run_build_args(
+        repo,
+        [
+            "--dut",
+            str(design),
+            "--out-dir",
+            str(out_dir),
+            "--target",
+            "cpp",
+            "--param",
+            "width=16",
+            "--jobs",
+            "1",
+        ],
+        fake_pycc,
+    )
+
+    tb_build = _run_build_args(
+        repo,
+        [
+            "--tb",
+            str(tb),
+            "--out-dir",
+            str(out_dir),
+            "--target",
+            "cpp",
+            "--jobs",
+            "1",
+        ],
+        fake_pycc,
+    )
+    assert "jit-cache: hit" in tb_build.stdout
+    cache = json.loads((out_dir / ".build_cache.json").read_text(encoding="utf-8"))
+    assert cache["param_overrides"] == ["width=16"]
+    assert cache["last_pycc_job_names"] == ["tb-cpp:tb_dut"]
+
+    bad_tb_build = _run_build_args(
+        repo,
+        [
+            "--tb",
+            str(tb),
+            "--out-dir",
+            str(out_dir),
+            "--target",
+            "cpp",
+            "--param",
+            "width=8",
+            "--jobs",
+            "1",
+        ],
+        fake_pycc,
+        check=False,
+    )
+    assert bad_tb_build.returncode != 0
+    assert "build --tb cannot change DUT --param overrides" in bad_tb_build.stderr
 
 
 def test_split_build_tb_only_change_does_not_recompile_dut(tmp_path: Path) -> None:

@@ -74,6 +74,8 @@ python3 -m pycircuit.cli build <tb_or_top.py> --out-dir <dir>
 - 只读取 `--tb`，从 `--out-dir` 的 `project_manifest.json` 和 cache 还原 DUT
   接口、module `.pyc`、probe manifest/plan 以及目标 DUT artifacts。
 - 不 import `--dut`，也不会回退到 DUT JIT 或 DUT pycc。
+- 不带 `--param` 时会保留缓存中的 DUT 参数；若显式传入 `--param`，必须与
+  缓存中的 DUT 参数完全一致，否则命令失败并要求先重新运行 DUT 构建。
 - 若 DUT cache 缺失、目标 artifacts 缺失、pycc/device flags 不匹配，命令会
   失败并要求先运行 dut-only 或完整 split 构建。
 
@@ -160,7 +162,7 @@ PYTHONPATH=compiler/frontend \
 - TB 文件必须保持独立；如果 TB 自己 `import` DUT design 文件，Python import
   仍会执行 DUT 顶层代码，CLI 无法替 TB 隔离这种依赖。
 - TB 侧新增或修改 `@probe` 定义时，为保证 probe plan 正确性，当前会退回完整
-  design/TB probe 解析路径。
+  DUT/TB probe 解析路径。
 - CMake 目标结构暂未改成独立 DUT library target。当前已经是 DUT `.cpp`
   和 TB `.cpp` 分别编译成 object，再链接成同一个 `pyc_tb`，足够覆盖本次
   TB-only 增量目标。
