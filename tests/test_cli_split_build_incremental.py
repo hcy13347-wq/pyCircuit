@@ -140,18 +140,12 @@ def _run_build(
     tb: Path,
     out_dir: Path,
     fake_pycc: Path,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(repo / "compiler" / "frontend")
-    env["PYCC"] = str(fake_pycc)
-    env["PYC_TOOLCHAIN_ROOT"] = str(repo / ".pycircuit_out" / "toolchain" / "install")
-    return subprocess.run(
+    return _run_build_args(
+        repo,
         [
-            sys.executable,
-            "-m",
-            "pycircuit.cli",
-            "build",
-            "--design",
+            "--dut",
             str(design),
             "--tb",
             str(tb),
@@ -161,6 +155,31 @@ def _run_build(
             "cpp",
             "--jobs",
             "1",
+        ],
+        fake_pycc,
+        extra_env=extra_env,
+    )
+
+
+def _run_build_args(
+    repo: Path,
+    build_args: list[str],
+    fake_pycc: Path,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(repo / "compiler" / "frontend")
+    env["PYCC"] = str(fake_pycc)
+    env["PYC_TOOLCHAIN_ROOT"] = str(repo / ".pycircuit_out" / "toolchain" / "install")
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pycircuit.cli",
+            "build",
+            *build_args,
         ],
         cwd=repo,
         env=env,
@@ -175,6 +194,147 @@ def _single_object(out_dir: Path, name: str) -> Path:
     matches = sorted(obj_root.rglob(name))
     assert len(matches) == 1
     return matches[0]
+
+
+def test_build_dut_only_generates_only_dut_cpp(tmp_path: Path) -> None:
+    repo = Path(__file__).resolve().parents[1]
+    case_dir = tmp_path / "case"
+    case_dir.mkdir()
+    design = case_dir / "dut_design.py"
+    out_dir = tmp_path / "out"
+    fake_pycc = tmp_path / "fake_pycc.py"
+    _write_fake_pycc(fake_pycc)
+
+    design.write_text(
+        "\n".join(
+            [
+                "from pycircuit import Circuit, module, u",
+                "",
+                "@module",
+                "def build(m: Circuit, width: int = 8) -> None:",
+                "    x = m.input('x', width=width)",
+                "    m.output('y', x + u(width, 0))",
+                "",
+                "build.__pycircuit_name__ = 'dut'",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    first = _run_build_args(
+        repo,
+        [
+            "--dut",
+            str(design),
+            "--out-dir",
+            str(out_dir),
+            "--target",
+            "cpp",
+            "--jobs",
+            "1",
+        ],
+        fake_pycc,
+    )
+
+    assert "jit-cache: miss" in first.stdout
+    manifest = json.loads((out_dir / "project_manifest.json").read_text(encoding="utf-8"))
+    cache = json.loads((out_dir / ".build_cache.json").read_text(encoding="utf-8"))
+    assert "testbench" not in manifest
+    assert "cpp_executable" not in manifest
+    assert (out_dir / "device" / "cpp" / "dut" / "dut.cpp").is_file()
+    assert (out_dir / "device" / "cpp" / "dut" / "dut.hpp").is_file()
+    assert not (out_dir / "tb").exists()
+    assert not (out_dir / "cpp_build").exists()
+    assert cache["build_mode"] == "dut-only"
+    assert cache["last_pycc_job_names"] == ["probe-catalog", "cpp:dut"]
+
+
+def test_build_tb_only_reuses_design_cache_without_importing_dut(tmp_path: Path) -> None:
+    repo = Path(__file__).resolve().parents[1]
+    case_dir = tmp_path / "case"
+    case_dir.mkdir()
+    design = case_dir / "dut_design.py"
+    tb = case_dir / "dut_tb.py"
+    out_dir = tmp_path / "out"
+    fake_pycc = tmp_path / "fake_pycc.py"
+    _write_fake_pycc(fake_pycc)
+
+    design.write_text(
+        "\n".join(
+            [
+                "import os",
+                "from pycircuit import Circuit, module, u",
+                "",
+                "if os.environ.get('DESIGN_IMPORT_FAIL'):",
+                "    raise RuntimeError('DUT import should be skipped on explicit TB-only build')",
+                "",
+                "@module",
+                "def build(m: Circuit, width: int = 8) -> None:",
+                "    x = m.input('x', width=width)",
+                "    m.output('y', x + u(width, 0))",
+                "",
+                "build.__pycircuit_name__ = 'dut'",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    tb.write_text(
+        "\n".join(
+            [
+                "from pycircuit import Tb, testbench",
+                "",
+                "@testbench",
+                "def tb(t: Tb) -> None:",
+                "    t.drive('x', 1, at=0)",
+                "    t.expect('y', 1, at=0)",
+                "    t.finish(at=1)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    design_build = _run_build_args(
+        repo,
+        [
+            "--dut",
+            str(design),
+            "--out-dir",
+            str(out_dir),
+            "--target",
+            "cpp",
+            "--jobs",
+            "1",
+        ],
+        fake_pycc,
+    )
+    assert "jit-cache: miss" in design_build.stdout
+
+    tb_build = _run_build_args(
+        repo,
+        [
+            "--tb",
+            str(tb),
+            "--out-dir",
+            str(out_dir),
+            "--target",
+            "cpp",
+            "--jobs",
+            "1",
+        ],
+        fake_pycc,
+        extra_env={"DESIGN_IMPORT_FAIL": "1"},
+    )
+
+    assert "jit-cache: hit" in tb_build.stdout
+    cache = json.loads((out_dir / ".build_cache.json").read_text(encoding="utf-8"))
+    assert cache["build_mode"] == "tb-only"
+    assert cache["dut_src"] == str(design)
+    assert cache["design_cache_fast_path"] is True
+    assert cache["last_pycc_job_names"] == ["tb-cpp:tb_dut"]
+    assert (out_dir / "tb" / "tb_dut.cpp").is_file()
 
 
 def test_split_build_tb_only_change_does_not_recompile_dut(tmp_path: Path) -> None:
@@ -247,5 +407,79 @@ def test_split_build_tb_only_change_does_not_recompile_dut(tmp_path: Path) -> No
     assert "jit-cache: hit" in second.stdout
     cache = json.loads((out_dir / ".build_cache.json").read_text(encoding="utf-8"))
     assert cache["last_pycc_job_names"] == ["tb-cpp:tb_dut"]
+    assert cache["design_cache_fast_path"] is True
     assert dut_obj.stat().st_mtime_ns == dut_obj_mtime
     assert tb_obj.stat().st_mtime_ns > tb_obj_mtime
+
+
+def test_split_build_tb_only_fast_path_does_not_import_dut(tmp_path: Path) -> None:
+    repo = Path(__file__).resolve().parents[1]
+    case_dir = tmp_path / "case"
+    case_dir.mkdir()
+    design = case_dir / "dut_design.py"
+    tb = case_dir / "dut_tb.py"
+    out_dir = tmp_path / "out"
+    fake_pycc = tmp_path / "fake_pycc.py"
+    _write_fake_pycc(fake_pycc)
+
+    design.write_text(
+        "\n".join(
+            [
+                "import os",
+                "from pycircuit import Circuit, module, u",
+                "",
+                "if os.environ.get('DESIGN_IMPORT_FAIL'):",
+                "    raise RuntimeError('DUT import should be skipped on TB-only rebuild')",
+                "",
+                "@module",
+                "def build(m: Circuit, width: int = 8) -> None:",
+                "    x = m.input('x', width=width)",
+                "    m.output('y', x + u(width, 0))",
+                "",
+                "build.__pycircuit_name__ = 'dut'",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    tb.write_text(
+        "\n".join(
+            [
+                "from pycircuit import Tb, testbench",
+                "",
+                "@testbench",
+                "def tb(t: Tb) -> None:",
+                "    t.drive('x', 1, at=0)",
+                "    t.expect('y', 1, at=0)",
+                "    t.finish(at=1)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    first = _run_build(repo, design, tb, out_dir, fake_pycc)
+    assert "jit-cache: miss" in first.stdout
+
+    time.sleep(1.1)
+    tb.write_text(
+        "\n".join(
+            [
+                "from pycircuit import Tb, testbench",
+                "",
+                "@testbench",
+                "def tb(t: Tb) -> None:",
+                "    t.drive('x', 2, at=0)",
+                "    t.expect('y', 2, at=0)",
+                "    t.finish(at=1)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    second = _run_build(repo, design, tb, out_dir, fake_pycc, extra_env={"DESIGN_IMPORT_FAIL": "1"})
+    assert "jit-cache: hit" in second.stdout
+    cache = json.loads((out_dir / ".build_cache.json").read_text(encoding="utf-8"))
+    assert cache["design_cache_fast_path"] is True
+    assert cache["last_pycc_job_names"] == ["tb-cpp:tb_dut"]
