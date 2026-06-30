@@ -68,6 +68,20 @@ Review 要点：
 - `_resolve_build_source_args()`：约 `80-101` 行
 - argparse `build.add_argument(...)`：约 `3649-3666` 行
 
+要实现什么：
+
+- 把用户传入的 build 命令归一化成 `(design_src, tb_src, build_mode)`。
+- `python_file` positional 入口必须继续映射成旧的单文件模式。
+- `--dut` 和 `--tb` 必须能单独或组合使用。
+- 公开 CLI 概念必须是 `DUT`，不是 `design`。
+
+作用：
+
+- 这是整个解耦构建的入口契约。后续 `_cmd_build()` 不再通过猜测文件内容来判断
+  DUT/TB，而是完全依赖这里返回的 `build_mode`。
+- `design_src is None` 是 tb-only 不 import/JIT DUT 的前置条件。
+- `tb_src is None` 是 dut-only 不生成 TB 的前置条件。
+
 需要确认：
 
 - `--dut` 是公开参数。
@@ -75,6 +89,11 @@ Review 要点：
 - positional 与 `--dut/--tb` 不能混用。
 - `--design` 只作为 `argparse.SUPPRESS` 的兼容别名。
 - 错误提示使用 `--dut/--tb`，不再引导用户使用 `--design`。
+- 四种返回值符合预期：
+  - `build top.py` -> `(top.py, top.py, "single")`
+  - `build --dut dut.py --tb tb.py` -> `(dut.py, tb.py, "split")`
+  - `build --dut dut.py` -> `(dut.py, None, "dut-only")`
+  - `build --tb tb.py` -> `(None, tb.py, "tb-only")`
 
 ### 2. Cached DUT artifact loader
 
@@ -85,6 +104,21 @@ Review 要点：
 - `_load_cached_design_artifacts()`：约 `2640-2676` 行
 - `_try_load_cached_design_artifacts()`：约 `2679-2704` 行
 
+要实现什么：
+
+- 从 `--out-dir` 中恢复一个可用于 TB 生成的 DUT 描述，而不读取 DUT Python 源码。
+- 确认缓存中的 manifest、module `.pyc`、top interface、cache key 是自洽的。
+- 在完整 split build 的 fast path 下，额外确认 DUT 源依赖和参数没有变化。
+
+作用：
+
+- `_load_cached_design_artifacts()` 是 tb-only 的核心。它让 `--tb` 能够拿到 DUT
+  interface、module paths、design cache inputs，而不需要 `--dut`。
+- `_try_load_cached_design_artifacts()` 是 split 模式的优化入口。因为 split 命令
+  有 DUT 源路径，所以它可以额外检查源文件 fingerprint；如果检查失败，后续可以
+  回退到完整 DUT JIT。
+- 两者分开是为了保证 tb-only 严格只复用 cache，而 split 可以自动增量。
+
 需要确认：
 
 - tb-only 只读取 `project_manifest.json`、`.build_cache.json`、`device/design.pyc`
@@ -92,6 +126,8 @@ Review 要点：
 - 这里不 import DUT Python 源文件。
 - split fast path 会检查 `dut_src/design_src`、`param_overrides` 和 design dependency fingerprint。
 - 缓存 key 使用 `_canonical_hash(design_cache_inputs)` 重新校验，不能只信任 cache 字段。
+- `_load_cached_design_artifacts()` 失败时，tb-only 应向用户提示先跑 `--dut`。
+- `_try_load_cached_design_artifacts()` 失败时，split 不应该报错，而应该允许后续完整重建 DUT。
 
 ### 3. TB-only fast path
 
@@ -104,6 +140,24 @@ Review 要点：
 - DUT pycc job 禁止回退：约 `3133-3201` 行
 - TB pycc job 生成：约 `3298-3324` 行
 
+要实现什么：
+
+- `--tb` 单独构建时，只 import TB 文件，只生成 TB `.pyc` 和 TB backend outputs。
+- 如果 DUT cache/artifacts 不完整或 flags 不匹配，命令必须失败。
+- tb-only 不允许改变 DUT JIT 参数。
+- tb-only 不允许自动补跑 DUT 相关 backend job。
+
+作用：
+
+- 这是“完全解耦”的主要证明位置。`tb_only` 分支没有 DUT 源文件，因此任何
+  DUT import/JIT/pycc 都是错误行为。
+- `fast_path_ready` 是 tb-only 能否继续的硬门槛。它同时检查：
+  - device backend flags 是否一致
+  - cached `design.pyc` hash 是否一致
+  - `probe_catalog.json`、`probe_manifest.json`、`probe_plan.json` 是否存在
+  - requested target 对应的 DUT C++/Verilog artifacts 是否存在
+- 只有 TB 侧检查通过后，才允许进入 TB payload 和 TB pycc 生成。
+
 需要确认：
 
 - `tb_only` 时如果显式传入不同 `--param`，必须失败。
@@ -113,6 +167,9 @@ Review 要点：
 - `tb_only` 不能自动追加 `probe-catalog`、`cpp:<dut>`、`verilog:<dut>` jobs。
 - `tb_only` 只允许追加 `tb-cpp:<tb>` 或 `tb-sv:<tb>` jobs。
 - TB 文件如果新增 `@probe`，当前不能在 tb-only 下重新解析 DUT，应失败并提示跑完整 split build。
+- `design_cache_fast_path=True` 时，应已经设置好 `manifest`、`module_paths`、
+  `design_pyc_path`、`iface`、`probe_manifest_obj` 和 `probe_plan_path`。
+- `if not design_cache_fast_path` 分支里有 `design_src is None` 的保护；tb-only 不应进入这个分支。
 
 ### 4. DUT-only path
 
@@ -124,12 +181,29 @@ Review 要点：
 - 清理 TB manifest 字段：约 `3254-3256` 行
 - TB/CMake/Verilator guard：约 `3298` 行之后的 `has_tb` 条件
 
+要实现什么：
+
+- `--dut` 单独构建时完成 DUT 侧所有必要产物生成。
+- 不要求用户提供 TB 文件。
+- 不调用 TB payload 生成、TB pycc 生成、CMake executable 生成、Verilator 运行。
+
+作用：
+
+- 这是“只改 DUT，不改 TB”时的手动窄构建入口。
+- 它也为后续 tb-only 构建准备可复用的 DUT cache/artifacts。
+- 清理 manifest 中旧的 TB 字段，是为了避免一个旧 full build 的 `testbench` 或
+  `cpp_executable` 字段残留在新的 dut-only manifest 中，误导后续工具。
+
 需要确认：
 
 - `--dut` 单独可以完成 DUT JIT、multi `.pyc` emit、probe manifest/plan、DUT C++/Verilog emit。
 - `--dut` 单独不生成 `tb/*.pyc`、`tb/*.cpp`、`tb/*.sv`。
 - `--dut` 单独不生成 `cpp_build`/`pyc_tb` executable。
 - `--trace-config`、`--run-verilator`、`--run-arg` 在没有 TB 时应直接失败。
+- `last_pycc_job_names` 在首次 dut-only C++ 构建中应类似
+  `["probe-catalog", "cpp:<dut>"]`。
+- dut-only 后的 `project_manifest.json` 不应包含 `testbench`、`cpp_executable`、
+  `verilator_manifest` 等 TB/仿真字段。
 
 ### 5. Probe 行为
 
@@ -140,12 +214,30 @@ Review 要点：
 - `_resolve_probe_outputs()`：约 `2755-2848` 行
 - 调用处：约 `3161-3174` 行
 
+要实现什么：
+
+- 完整 split build 时，probe 函数可以来自 DUT 文件，也可以来自 TB 文件。
+- probe manifest 和 probe plan 仍然基于同一个 DUT hierarchy/catalog 生成。
+- tb-only 不重新解析或新增 probe plan，只能复用已有 plan。
+
+作用：
+
+- 拆开 Python 文件后，原先只扫描单个 module 的 probe 逻辑会漏掉另一侧定义的
+  `@probe`。这里把输入从单个 `mod` 扩展成 `mods`，用于覆盖 DUT/TB 两侧。
+- probe plan 会影响 DUT C++ 输出，因此 DUT C++ backend flags 包含
+  `probe_plan_hash`。probe 变化不能被误认为只是 TB 变化。
+- tb-only 禁止新增 `@probe`，是为了避免在没有 DUT 源和完整 probe resolution
+  上下文时产生不一致的 probe plan。
+
 需要确认：
 
 - full split build 会同时扫描 DUT module 和 TB module。
 - tb-only fast path 不重新解析 DUT probe plan，只复用缓存中的
   `probe_manifest.json` 和 `probe_plan.json`。
 - TB 侧新增 `@probe` 时不能静默复用旧 probe plan。
+- `_resolve_probe_outputs(mods=[...])` 应去重 module 和 probe function，避免同一
+  module 被 DUT/TB 共同引用时重复生成 probe entries。
+- DUT C++ backend cache 必须包含 `probe_plan_hash`，防止 probe alias 变化时误用旧 C++。
 
 ### 6. Cache 输出
 
@@ -155,6 +247,21 @@ Review 要点：
 
 - cache 写回：约 `3485-3515` 行
 
+要实现什么：
+
+- 把本次构建的依赖 hash、backend flags、DUT/TB 源路径、JIT 参数和实际 pycc jobs
+  写回 `.build_cache.json`。
+- 保证旧字段兼容，同时加入新的 `dut_src` 和更细粒度 backend flags。
+- 让测试和人工排查可以直接从 cache 判断本次是否只跑了 TB。
+
+作用：
+
+- `.build_cache.json` 是下一次 split/tb-only 判断能否复用 DUT 的依据。
+- `last_pycc_job_names` 是本 PR 的核心可观测证据：只改 TB 时应只看到
+  `tb-cpp:*` 或 `tb-sv:*`。
+- `param_overrides` 如果在 tb-only 下被覆盖成空列表，会导致参数化 DUT 后续误复用；
+  因此这里必须写回经过 tb-only 修正后的参数。
+
 需要确认：
 
 - `dut_src` 被写入 cache。
@@ -163,6 +270,9 @@ Review 要点：
 - `last_pycc_job_names` 可用于验证本次实际运行了哪些 pycc job。
 - `device_backend_flags_hash`、`device_cpp_backend_flags_hash`、
   `device_verilog_backend_flags_hash`、`tb_backend_flags_hash` 分别记录。
+- `build_mode` 能准确反映本次入口：`single`、`split`、`dut-only` 或 `tb-only`。
+- `design_cache_fast_path` 为 `True` 时，表示本次没有 import/JIT DUT。
+- `module_hashes` 同时记录 `__design_pyc`、各 DUT module，以及 TB `.pyc` hash。
 
 ## 测试 Review
 
