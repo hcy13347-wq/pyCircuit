@@ -14,7 +14,7 @@ import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from .api_contract import collect_local_python_graph, nearest_project_root, scan_file
 from .diagnostics import render_diagnostic
@@ -75,6 +75,30 @@ def _load_py_file(path: Path) -> object:
     sys.modules[spec.name] = m
     spec.loader.exec_module(m)
     return m
+
+
+def _resolve_build_source_args(args: argparse.Namespace) -> tuple[Path | None, Path | None, str]:
+    positional = str(getattr(args, "python_file", "") or "").strip()
+    dut_arg = str(getattr(args, "dut", "") or getattr(args, "design", "") or "").strip()
+    tb_arg = str(getattr(args, "tb", "") or "").strip()
+
+    if positional and (dut_arg or tb_arg):
+        raise SystemExit("build accepts either a positional python_file or --dut/--tb, not both")
+
+    if positional:
+        src = Path(positional).resolve()
+        return (src, src, "single")
+
+    if dut_arg or tb_arg:
+        design_src = Path(dut_arg).resolve() if dut_arg else None
+        tb_src = Path(tb_arg).resolve() if tb_arg else None
+        if design_src is not None and tb_src is not None:
+            return (design_src, tb_src, "split")
+        if design_src is not None:
+            return (design_src, None, "dut-only")
+        return (None, tb_src, "tb-only")
+
+    raise SystemExit("build requires a python_file, --dut, --tb, or --dut/--tb")
 
 
 def _resolve_emit_source(src_arg: str) -> tuple[Path | None, object]:
@@ -2535,20 +2559,69 @@ def _module_hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _deps_hash(entry: Path, *, project_root: Path) -> str:
+def _design_dependency_fingerprint(entry: Path, *, project_root: Path) -> tuple[dict[str, Any], str]:
     root = project_root.resolve()
     files = collect_local_python_graph(entry.resolve(), project_root=root)
     h = hashlib.sha256()
+    entries: list[dict[str, str]] = []
     for p in files:
+        digest = hashlib.sha256(p.read_bytes()).hexdigest()
         try:
             rel = str(p.relative_to(root))
         except ValueError:
             rel = str(p)
         h.update(rel.encode("utf-8"))
         h.update(b"\0")
-        h.update(hashlib.sha256(p.read_bytes()).digest())
+        h.update(bytes.fromhex(digest))
         h.update(b"\0")
-    return h.hexdigest()
+        entries.append({"relpath": rel, "sha256": digest})
+    return (
+        {
+            "version": 1,
+            "entry": str(entry.resolve()),
+            "project_root": str(root),
+            "files": entries,
+        },
+        h.hexdigest(),
+    )
+
+
+def _cached_design_dependencies_match(
+    fingerprint: Any,
+    *,
+    entry: Path,
+    project_root: Path,
+) -> bool:
+    if not isinstance(fingerprint, Mapping) or int(fingerprint.get("version", 0) or 0) != 1:
+        return False
+    raw_files = fingerprint.get("files", None)
+    if not isinstance(raw_files, list) or not raw_files:
+        return False
+
+    root = project_root.resolve()
+    try:
+        entry_rel = str(entry.resolve().relative_to(root))
+    except ValueError:
+        entry_rel = str(entry.resolve())
+
+    seen_entry = False
+    for raw in raw_files:
+        if not isinstance(raw, Mapping):
+            return False
+        rel = str(raw.get("relpath", "")).strip()
+        expected_hash = str(raw.get("sha256", "")).strip()
+        if not rel or not expected_hash:
+            return False
+        if rel == entry_rel:
+            seen_entry = True
+        p = Path(rel)
+        if not p.is_absolute():
+            p = root / p
+        if not p.is_file():
+            return False
+        if hashlib.sha256(p.read_bytes()).hexdigest() != expected_hash:
+            return False
+    return seen_entry
 
 
 def _canonical_hash(payload: dict[str, Any]) -> str:
@@ -2562,6 +2635,73 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 def _save_json(path: Path, data: dict[str, Any]) -> None:
     _write_text_atomic(path, json.dumps(data, sort_keys=True, indent=2) + "\n")
+
+
+def _load_cached_design_artifacts(
+    *,
+    cache: Mapping[str, Any],
+    manifest_path: Path,
+    out_dir: Path,
+) -> dict[str, Any]:
+    design_cache_inputs = cache.get("design_cache_inputs", cache.get("jit_cache_inputs", None))
+    if not isinstance(design_cache_inputs, Mapping):
+        raise ValueError("missing design cache inputs")
+    design_cache_inputs = dict(design_cache_inputs)
+    design_cache_key = str(cache.get("design_cache_key", cache.get("jit_cache_key", ""))).strip()
+    if not design_cache_key:
+        raise ValueError("missing design cache key")
+    if _canonical_hash(design_cache_inputs) != design_cache_key:
+        raise ValueError("stale design cache key")
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"missing cached project manifest: {manifest_path}")
+
+    manifest = _load_json(manifest_path)
+    module_paths = _module_paths_from_manifest(manifest, out_dir=out_dir)
+    if not all(p.is_file() for p in module_paths.values()):
+        raise FileNotFoundError("missing cached module .pyc artifacts")
+    design_pyc_rel = str(manifest.get("design_pyc", "")).strip()
+    design_pyc_path = (out_dir / design_pyc_rel) if design_pyc_rel else (out_dir / "device" / "design.pyc")
+    if not design_pyc_path.is_file():
+        raise FileNotFoundError(f"missing cached design .pyc artifact: {design_pyc_path}")
+    iface = _top_iface_from_manifest(manifest)
+
+    return {
+        "manifest": manifest,
+        "module_paths": module_paths,
+        "design_pyc_path": design_pyc_path,
+        "iface": iface,
+        "design_cache_inputs": design_cache_inputs,
+        "design_cache_key": design_cache_key,
+        "design_dependency_fingerprint": cache.get("design_dependency_fingerprint", None),
+    }
+
+
+def _try_load_cached_design_artifacts(
+    *,
+    cache: Mapping[str, Any],
+    manifest_path: Path,
+    out_dir: Path,
+    design_src: Path,
+    design_project_root: Path,
+    param_overrides: list[str],
+) -> dict[str, Any] | None:
+    cached_src = str(cache.get("dut_src", cache.get("design_src", ""))).strip()
+    if cached_src != str(design_src):
+        return None
+    if list(cache.get("param_overrides", []) or []) != list(param_overrides):
+        return None
+
+    if not _cached_design_dependencies_match(
+        cache.get("design_dependency_fingerprint", None),
+        entry=design_src,
+        project_root=design_project_root,
+    ):
+        return None
+
+    try:
+        return _load_cached_design_artifacts(cache=cache, manifest_path=manifest_path, out_dir=out_dir)
+    except Exception:
+        return None
 
 
 def _base_name_of(fn: Any) -> str:
@@ -2614,7 +2754,8 @@ def _module_bases_from_manifest(manifest: Mapping[str, Any]) -> dict[str, list[s
 
 def _resolve_probe_outputs(
     *,
-    mod: object,
+    mod: object | None = None,
+    mods: Iterable[object] | None = None,
     manifest: Mapping[str, Any],
     probe_catalog_path: Path,
     out_dir: Path,
@@ -2639,11 +2780,17 @@ def _resolve_probe_outputs(
         seen_module_ids.add(mod_id)
         probe_modules.append(candidate)
 
-    add_probe_module(mod)
-    for value in vars(mod).values():
-        owner = inspect.getmodule(value) if callable(value) else None
-        if owner is not None:
-            add_probe_module(owner)
+    raw_mods: list[object] = []
+    if mods is not None:
+        raw_mods.extend(list(mods))
+    elif mod is not None:
+        raw_mods.append(mod)
+    for probe_root_mod in raw_mods:
+        add_probe_module(probe_root_mod)
+        for value in vars(probe_root_mod).values():
+            owner = inspect.getmodule(value) if callable(value) else None
+            if owner is not None:
+                add_probe_module(owner)
 
     seen_probe_fns: set[int] = set()
     probe_fns: list[Any] = []
@@ -2702,73 +2849,28 @@ def _resolve_probe_outputs(
 
 
 def _cmd_build(args: argparse.Namespace) -> int:
-    src = Path(args.python_file).resolve()
+    design_src, tb_src, build_mode = _resolve_build_source_args(args)
+    has_design = design_src is not None
+    has_tb = tb_src is not None
+    split_inputs = build_mode != "single"
+    tb_only = build_mode == "tb-only"
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     cache_path = out_dir / ".build_cache.json"
     cache = _load_json(cache_path) if cache_path.is_file() else {"module_hashes": {}}
-
-    project_root = _project_root(src, project_root_override=args.project_root)
-    _scan_api_contract(src, project_root_override=str(project_root))
-    mod = _load_py_file(src)
-    if not hasattr(mod, "build") or not callable(getattr(mod, "build")):
-        raise SystemExit(f"{src} must define a pyCircuit entrypoint: `@module def build(m: Circuit, ...)`")
-    build = getattr(mod, "build")
-    jit_params = _collect_jit_params(build, overrides=list(getattr(args, "param", []) or []))
-    top_name = _top_name_for_build(src, build)
-
-    from .design import canonical_params_json
-
-    try:
-        jit_params_json = canonical_params_json(jit_params, path="jit_params")
-    except DesignError as e:
-        raise SystemExit(f"JIT param canonicalization failed: {e}") from e
-    jit_inputs = {
-        "version": 1,
-        "entry_hash": _module_hash(src),
-        "deps_hash": _deps_hash(src, project_root=project_root),
-        "jit_params_json": jit_params_json,
-        "top_name": top_name,
-        "frontend_contract": FRONTEND_CONTRACT,
-    }
-    jit_key = _canonical_hash(jit_inputs)
-
     manifest_path = out_dir / "project_manifest.json"
-    design: Design | None = None
-    manifest: dict[str, Any]
-    module_paths: dict[str, Path]
-    design_pyc_path: Path
-    iface: _TopIface
-
-    cached_key = str(cache.get("jit_cache_key", "")).strip()
-    cache_hit = cached_key == jit_key and manifest_path.is_file()
-    if cache_hit:
-        try:
-            manifest = _load_json(manifest_path)
-            module_paths = _module_paths_from_manifest(manifest, out_dir=out_dir)
-            if not all(p.is_file() for p in module_paths.values()):
-                raise FileNotFoundError("missing cached .pyc modules")
-            design_pyc_rel = str(manifest.get("design_pyc", "")).strip()
-            design_pyc_path = (out_dir / design_pyc_rel) if design_pyc_rel else (out_dir / "device" / "design.pyc")
-            if not design_pyc_path.is_file():
-                raise FileNotFoundError("missing cached design.pyc")
-            iface = _top_iface_from_manifest(manifest)
-            print("jit-cache: hit")
-        except Exception:
-            cache_hit = False
-
-    if not cache_hit:
-        try:
-            design_obj = compile(build, name=top_name, **jit_params)
-        except (DesignError, JitError) as e:
-            raise SystemExit(f"design compile failed: {e}") from e
-        if not isinstance(design_obj, Design):
-            raise SystemExit("internal error: expected Design from compile(...)")
-        design = design_obj
-        iface = _top_iface(design)
-        manifest_path, manifest, module_paths, design_pyc_path = _emit_multi_pyc_artifacts(design, out_dir=out_dir)
-        print("jit-cache: miss")
+    param_overrides = list(getattr(args, "param", []) or [])
+    cached_param_overrides = list(cache.get("param_overrides", []) or [])
+    if tb_only:
+        if param_overrides and param_overrides != cached_param_overrides:
+            raise SystemExit(
+                "build --tb cannot change DUT --param overrides; "
+                "run `pycircuit build --dut <dut.py> --out-dir <dir> ...` first"
+            )
+        param_overrides = cached_param_overrides
+    design_project_root = _project_root(design_src, project_root_override=args.project_root) if has_design else None
+    tb_project_root = _project_root(tb_src, project_root_override=args.project_root) if has_tb else None
 
     pycc = _detect_pycc()
     jobs = max(1, int(args.jobs))
@@ -2784,6 +2886,14 @@ def _cmd_build(args: argparse.Namespace) -> int:
     target = str(args.target)
     do_cpp = target in {"cpp", "both"}
     do_v = target in {"verilator", "both"}
+    if not has_tb:
+        trace_cfg_path = getattr(args, "trace_config", None)
+        if trace_cfg_path is not None and str(trace_cfg_path).strip():
+            raise SystemExit("--trace-config requires a testbench build")
+        if bool(args.run_verilator):
+            raise SystemExit("--run-verilator requires a testbench build")
+        if list(getattr(args, "run_arg", []) or []):
+            raise SystemExit("--run-arg requires a testbench build")
     pycc_build_profile = "dev-fast" if str(args.profile) == "dev" else "release"
     pycc_hard_hierarchy_flags = [
         f"--build-profile={pycc_build_profile}",
@@ -2791,19 +2901,224 @@ def _cmd_build(args: argparse.Namespace) -> int:
         "--hierarchy-policy=strict",
     ]
 
-    build_flags = {
+    device_backend_flags = {
         "pycc": str(pycc.resolve()),
         "logic_depth": logic_depth,
-        "profile": str(args.profile),
         "pycc_build_profile": pycc_build_profile,
         "inline_policy": "off",
         "hierarchy_policy": "strict",
-        "target": target,
-        "tb_schedule_mode": str(args.tb_schedule_mode),
         "frontend_contract": FRONTEND_CONTRACT,
     }
+    device_backend_flags_hash = _canonical_hash(device_backend_flags)
+    same_device_flags = str(cache.get("device_backend_flags_hash", "")) == device_backend_flags_hash
+    tb_backend_flags = {
+        "pycc": str(pycc.resolve()),
+        "pycc_build_profile": pycc_build_profile,
+        "inline_policy": "off",
+        "hierarchy_policy": "strict",
+        "tb_schedule_mode": str(args.tb_schedule_mode),
+        "tb_schedule_format": str(args.tb_schedule_format),
+        "frontend_contract": FRONTEND_CONTRACT,
+    }
+    tb_backend_flags_hash = _canonical_hash(tb_backend_flags)
+    same_tb_flags = str(cache.get("tb_backend_flags_hash", "")) == tb_backend_flags_hash
+    build_flags = {
+        "device_backend_flags": device_backend_flags,
+        "tb_backend_flags": tb_backend_flags,
+        "profile": str(args.profile),
+        "target": target,
+    }
     build_flags_hash = _canonical_hash(build_flags)
-    same_flags = str(cache.get("build_flags_hash", "")) == build_flags_hash
+
+    design_mod: object | None = None
+    tb_mod: object | None = None
+    design: Design | None = None
+    manifest: dict[str, Any]
+    module_paths: dict[str, Path]
+    design_pyc_path: Path
+    iface: _TopIface
+    design_cache_inputs: dict[str, Any]
+    design_dependency_fingerprint: Any = None
+    probe_manifest_obj: dict[str, Any]
+    probe_section: dict[str, Any]
+    probe_plan_path: Path
+    design_cache_fast_path = False
+
+    cached_design = None
+    if tb_only:
+        try:
+            cached_design = _load_cached_design_artifacts(cache=cache, manifest_path=manifest_path, out_dir=out_dir)
+        except Exception as e:
+            raise SystemExit(
+                "build --tb requires cached DUT artifacts in --out-dir; "
+                "run `pycircuit build --dut <dut.py> --out-dir <dir>` first "
+                f"(reason: {e})"
+            ) from e
+    elif split_inputs and has_design and has_tb and tb_src != design_src:
+        cached_design = _try_load_cached_design_artifacts(
+            cache=cache,
+            manifest_path=manifest_path,
+            out_dir=out_dir,
+            design_src=design_src,
+            design_project_root=design_project_root,
+            param_overrides=param_overrides,
+        )
+
+    if cached_design is not None:
+        cached_manifest = dict(cached_design["manifest"])
+        cached_module_paths = dict(cached_design["module_paths"])
+        cached_design_pyc_path = Path(cached_design["design_pyc_path"])
+        cached_iface = cached_design["iface"]
+        cached_design_hash = _module_hash(cached_design_pyc_path)
+        old_hashes_for_fast_path = dict(cache.get("module_hashes", {}))
+        cached_probe_catalog_path = out_dir / "device" / "probe_catalog.json"
+        cached_probe_manifest_path = out_dir / "probe_manifest.json"
+        cached_probe_plan_path = out_dir / "probe_plan.json"
+        fast_path_ready = (
+            same_device_flags
+            and old_hashes_for_fast_path.get("__design_pyc") == cached_design_hash
+            and cached_probe_catalog_path.is_file()
+            and cached_probe_manifest_path.is_file()
+            and cached_probe_plan_path.is_file()
+        )
+        tb_has_probe_defs = False
+        if fast_path_ready:
+            cached_probe_plan_hash = _module_hash(cached_probe_plan_path)
+            cached_device_cpp_backend_flags = {
+                **device_backend_flags,
+                "probe_plan_hash": cached_probe_plan_hash,
+            }
+            cached_device_cpp_backend_flags_hash = _canonical_hash(cached_device_cpp_backend_flags)
+            cached_same_device_cpp_flags = (
+                str(cache.get("device_cpp_backend_flags_hash", "")) == cached_device_cpp_backend_flags_hash
+            )
+            cached_device_verilog_backend_flags_hash = _canonical_hash(dict(device_backend_flags))
+            cached_same_device_verilog_flags = (
+                str(cache.get("device_verilog_backend_flags_hash", cache.get("device_backend_flags_hash", "")))
+                == cached_device_verilog_backend_flags_hash
+            )
+            for sym, mp in sorted(cached_module_paths.items()):
+                h = _module_hash(mp)
+                if do_cpp:
+                    cpp_out_dir = device_cpp_root / sym
+                    cpp_ready = cpp_out_dir.is_dir() and any(cpp_out_dir.glob("*.cpp")) and any(
+                        cpp_out_dir.glob("*.hpp")
+                    )
+                    if not (cached_same_device_cpp_flags and old_hashes_for_fast_path.get(sym) == h and cpp_ready):
+                        fast_path_ready = False
+                        break
+                if do_v:
+                    verilog_out_dir = device_v_root / sym
+                    verilog_ready = verilog_out_dir.is_dir() and any(verilog_out_dir.glob("*.v"))
+                    if not (
+                        cached_same_device_verilog_flags
+                        and old_hashes_for_fast_path.get(sym) == h
+                        and verilog_ready
+                    ):
+                        fast_path_ready = False
+                        break
+
+        if fast_path_ready and has_tb:
+            assert tb_src is not None
+            assert tb_project_root is not None
+            _scan_api_contract(tb_src, project_root_override=str(tb_project_root))
+            tb_mod = _load_py_file(tb_src)
+            if collect_probe_functions(tb_mod):
+                tb_has_probe_defs = True
+                fast_path_ready = False
+
+        if fast_path_ready:
+            manifest = cached_manifest
+            module_paths = cached_module_paths
+            design_pyc_path = cached_design_pyc_path
+            iface = cached_iface
+            design_cache_inputs = dict(cached_design["design_cache_inputs"])
+            design_cache_key = str(cached_design["design_cache_key"])
+            design_dependency_fingerprint = cached_design.get("design_dependency_fingerprint", None)
+            probe_manifest_obj = _load_json(cached_probe_manifest_path)
+            probe_section = {"version": 1, "probes": list(manifest.get("probes", []))}
+            probe_plan_path = cached_probe_plan_path
+            design_cache_fast_path = True
+            print("jit-cache: hit")
+        elif tb_only:
+            if tb_has_probe_defs:
+                raise SystemExit(
+                    "build --tb cannot add or update @probe definitions without the design source; "
+                    "run a full `--dut <dut.py> --tb <tb.py>` build"
+                )
+            raise SystemExit(
+                "build --tb requires matching cached DUT artifacts for the requested target; "
+                "run `pycircuit build --dut <dut.py> --out-dir <dir> --target "
+                f"{target}` first"
+            )
+
+    if not design_cache_fast_path:
+        if design_src is None or design_project_root is None:
+            raise SystemExit("internal error: design source is required outside tb-only fast path")
+        _scan_api_contract(design_src, project_root_override=str(design_project_root))
+        if has_tb and tb_src != design_src:
+            assert tb_src is not None
+            assert tb_project_root is not None
+            _scan_api_contract(tb_src, project_root_override=str(tb_project_root))
+        design_mod = _load_py_file(design_src)
+        tb_mod = design_mod if tb_src == design_src else (_load_py_file(tb_src) if tb_src is not None else None)
+        if not hasattr(design_mod, "build") or not callable(getattr(design_mod, "build")):
+            raise SystemExit(f"{design_src} must define a pyCircuit entrypoint: `@module def build(m: Circuit, ...)`")
+        build = getattr(design_mod, "build")
+        jit_params = _collect_jit_params(build, overrides=param_overrides)
+        top_name = _top_name_for_build(design_src, build)
+
+        from .design import canonical_params_json
+
+        try:
+            jit_params_json = canonical_params_json(jit_params, path="jit_params")
+        except DesignError as e:
+            raise SystemExit(f"JIT param canonicalization failed: {e}") from e
+        design_dependency_fingerprint, design_deps_hash = _design_dependency_fingerprint(
+            design_src,
+            project_root=design_project_root,
+        )
+        design_cache_inputs = {
+            "version": 2,
+            "design_hash": _module_hash(design_src),
+            "design_deps_hash": design_deps_hash,
+            "design_relpath": str(design_src.relative_to(design_project_root))
+            if design_src.is_relative_to(design_project_root)
+            else str(design_src),
+            "jit_params_json": jit_params_json,
+            "top_name": top_name,
+            "frontend_contract": FRONTEND_CONTRACT,
+        }
+        design_cache_key = _canonical_hash(design_cache_inputs)
+
+        cached_key = str(cache.get("design_cache_key", cache.get("jit_cache_key", ""))).strip()
+        cache_hit = cached_key == design_cache_key and manifest_path.is_file()
+        if cache_hit:
+            try:
+                manifest = _load_json(manifest_path)
+                module_paths = _module_paths_from_manifest(manifest, out_dir=out_dir)
+                if not all(p.is_file() for p in module_paths.values()):
+                    raise FileNotFoundError("missing cached .pyc modules")
+                design_pyc_rel = str(manifest.get("design_pyc", "")).strip()
+                design_pyc_path = (out_dir / design_pyc_rel) if design_pyc_rel else (out_dir / "device" / "design.pyc")
+                if not design_pyc_path.is_file():
+                    raise FileNotFoundError("missing cached design.pyc")
+                iface = _top_iface_from_manifest(manifest)
+                print("jit-cache: hit")
+            except Exception:
+                cache_hit = False
+
+        if not cache_hit:
+            try:
+                design_obj = compile(build, name=top_name, **jit_params)
+            except (DesignError, JitError) as e:
+                raise SystemExit(f"design compile failed: {e}") from e
+            if not isinstance(design_obj, Design):
+                raise SystemExit("internal error: expected Design from compile(...)")
+            design = design_obj
+            iface = _top_iface(design)
+            manifest_path, manifest, module_paths, design_pyc_path = _emit_multi_pyc_artifacts(design, out_dir=out_dir)
+            print("jit-cache: miss")
 
     design_key = "__design_pyc"
     old_hashes = dict(cache.get("module_hashes", {}))
@@ -2812,9 +3127,15 @@ def _cmd_build(args: argparse.Namespace) -> int:
     module_hashes[design_key] = design_hash
     probe_catalog_path = out_dir / "device" / "probe_catalog.json"
     probe_catalog_ready = probe_catalog_path.is_file()
-    probe_unchanged = same_flags and old_hashes.get(design_key) == design_hash
+    probe_unchanged = same_device_flags and old_hashes.get(design_key) == design_hash
     pycc_jobs: list[tuple[str, list[str]]] = []
+    last_pycc_job_names: list[str] = []
     if not (probe_unchanged and probe_catalog_ready):
+        if tb_only:
+            raise SystemExit(
+                "build --tb requires a cached DUT probe catalog matching the requested flags; "
+                "run `pycircuit build --dut <dut.py> --out-dir <dir>` first"
+            )
         pycc_jobs.append(
             (
                 "probe-catalog",
@@ -2830,70 +3151,54 @@ def _cmd_build(args: argparse.Namespace) -> int:
             )
         )
     if pycc_jobs:
+        last_pycc_job_names.extend(name for name, _cmd in pycc_jobs)
         with ProcessPoolExecutor(max_workers=jobs) as pool:
             futs = {pool.submit(_run_backend_job, j): j[0] for j in pycc_jobs}
             for fut in as_completed(futs):
                 _ = fut.result()
         pycc_jobs = []
 
-    try:
-        probe_manifest_obj, probe_section, probe_plan_path = _resolve_probe_outputs(
-            mod=mod,
-            manifest=manifest,
-            probe_catalog_path=probe_catalog_path,
-            out_dir=out_dir,
-        )
-    except ProbeError as e:
-        raise SystemExit(f"probe resolution failed: {e}") from e
     probe_manifest_path = out_dir / "probe_manifest.json"
-    _save_json(probe_manifest_path, probe_manifest_obj)
+    if not design_cache_fast_path:
+        try:
+            probe_manifest_obj, probe_section, probe_plan_path = _resolve_probe_outputs(
+                mods=[m for m in (design_mod, tb_mod) if m is not None],
+                manifest=manifest,
+                probe_catalog_path=probe_catalog_path,
+                out_dir=out_dir,
+            )
+        except ProbeError as e:
+            raise SystemExit(f"probe resolution failed: {e}") from e
+        _save_json(probe_manifest_path, probe_manifest_obj)
     manifest["probe_manifest"] = str(probe_manifest_path.relative_to(out_dir))
     manifest["probes"] = list(probe_section.get("probes", []))
 
-    trace_plan: TracePlan | None = None
-    trace_cfg_path = getattr(args, "trace_config", None)
-    if trace_cfg_path is not None:
-        raw = str(trace_cfg_path).strip()
-        if raw:
-            try:
-                cfg = load_trace_config(Path(raw))
-                trace_plan = compute_trace_plan_from_artifacts(
-                    manifest=manifest,
-                    module_paths=module_paths,
-                    config=cfg,
-                    probe_manifest=probe_manifest_obj,
-                )
-            except TraceConfigError as e:
-                raise SystemExit(f"trace config error: {e}") from e
-
-    tb_probes = TbProbes.from_probe_manifest(probe_manifest_obj)
-    tb_name, tb_payload_json = _collect_testbench_payload(
-        mod,
-        iface,
-        trace_plan=trace_plan,
-        tb_probes=tb_probes,
-        tb_schedule_mode=str(args.tb_schedule_mode),
-        tb_schedule_format=str(args.tb_schedule_format),
-        tb_schedule_dir=out_dir / "tb",
+    device_cpp_backend_flags = {
+        **device_backend_flags,
+        "probe_plan_hash": _module_hash(probe_plan_path),
+    }
+    device_cpp_backend_flags_hash = _canonical_hash(device_cpp_backend_flags)
+    same_device_cpp_flags = str(cache.get("device_cpp_backend_flags_hash", "")) == device_cpp_backend_flags_hash
+    device_verilog_backend_flags = dict(device_backend_flags)
+    device_verilog_backend_flags_hash = _canonical_hash(device_verilog_backend_flags)
+    same_device_verilog_flags = (
+        str(cache.get("device_verilog_backend_flags_hash", cache.get("device_backend_flags_hash", "")))
+        == device_verilog_backend_flags_hash
     )
-    tb_pyc_path = _emit_testbench_pyc_file(out_dir=out_dir, tb_name=tb_name, payload_json=tb_payload_json)
-    manifest["testbench"] = {"name": tb_name, "pyc": str(tb_pyc_path.relative_to(out_dir))}
-    if trace_plan is not None:
-        trace_path = out_dir / "trace_plan.json"
-        _save_json(trace_path, trace_plan.as_dict())
-        manifest["trace_plan"] = str(trace_path.relative_to(out_dir))
-
-    tb_cpp_out = out_dir / "tb" / f"{tb_name}.cpp"
-    tb_sv_out = out_dir / "tb" / f"{tb_name}.sv"
     for sym in sorted(module_paths.keys()):
         mp = module_paths[sym]
         h = _module_hash(mp)
         module_hashes[sym] = h
-        unchanged = same_flags and old_hashes.get(sym) == h
 
         cpp_out_dir = device_cpp_root / sym
         cpp_ready = cpp_out_dir.is_dir() and any(cpp_out_dir.glob("*.cpp")) and any(cpp_out_dir.glob("*.hpp"))
-        if do_cpp and not (unchanged and cpp_ready):
+        cpp_unchanged = same_device_cpp_flags and old_hashes.get(sym) == h
+        if do_cpp and not (cpp_unchanged and cpp_ready):
+            if tb_only:
+                raise SystemExit(
+                    f"build --tb requires cached DUT C++ artifacts for module {sym!r}; "
+                    "run `pycircuit build --dut <dut.py> --out-dir <dir> --target cpp` first"
+                )
             cpp_out_dir.mkdir(parents=True, exist_ok=True)
             pycc_jobs.append(
                 (
@@ -2915,7 +3220,13 @@ def _cmd_build(args: argparse.Namespace) -> int:
 
         verilog_out_dir = device_v_root / sym
         verilog_ready = verilog_out_dir.is_dir() and any(verilog_out_dir.glob("*.v"))
-        if do_v and not (unchanged and verilog_ready):
+        verilog_unchanged = same_device_verilog_flags and old_hashes.get(sym) == h
+        if do_v and not (verilog_unchanged and verilog_ready):
+            if tb_only:
+                raise SystemExit(
+                    f"build --tb requires cached DUT Verilog artifacts for module {sym!r}; "
+                    "run `pycircuit build --dut <dut.py> --out-dir <dir> --target verilator` first"
+                )
             verilog_out_dir.mkdir(parents=True, exist_ok=True)
             pycc_jobs.append(
                 (
@@ -2932,11 +3243,63 @@ def _cmd_build(args: argparse.Namespace) -> int:
                 )
             )
 
-    if do_cpp:
+    if pycc_jobs:
+        last_pycc_job_names.extend(name for name, _cmd in pycc_jobs)
+        with ProcessPoolExecutor(max_workers=jobs) as pool:
+            futs = {pool.submit(_run_backend_job, j): j[0] for j in pycc_jobs}
+            for fut in as_completed(futs):
+                _ = fut.result()
+        pycc_jobs = []
+
+    if not has_tb:
+        for key in ("testbench", "trace_plan", "cpp_executable", "verilator_manifest", "verilator_binary"):
+            manifest.pop(key, None)
+    else:
+        if tb_mod is None:
+            raise SystemExit("internal error: testbench source was not loaded")
+        trace_plan: TracePlan | None = None
+        trace_cfg_path = getattr(args, "trace_config", None)
+        if trace_cfg_path is not None:
+            raw = str(trace_cfg_path).strip()
+            if raw:
+                try:
+                    cfg = load_trace_config(Path(raw))
+                    trace_plan = compute_trace_plan_from_artifacts(
+                        manifest=manifest,
+                        module_paths=module_paths,
+                        config=cfg,
+                        probe_manifest=probe_manifest_obj,
+                    )
+                except TraceConfigError as e:
+                    raise SystemExit(f"trace config error: {e}") from e
+
+        tb_probes = TbProbes.from_probe_manifest(probe_manifest_obj)
+        tb_name, tb_payload_json = _collect_testbench_payload(
+            tb_mod,
+            iface,
+            trace_plan=trace_plan,
+            tb_probes=tb_probes,
+            tb_schedule_mode=str(args.tb_schedule_mode),
+            tb_schedule_format=str(args.tb_schedule_format),
+            tb_schedule_dir=out_dir / "tb",
+        )
+        tb_pyc_path = _emit_testbench_pyc_file(out_dir=out_dir, tb_name=tb_name, payload_json=tb_payload_json)
+        manifest["testbench"] = {"name": tb_name, "pyc": str(tb_pyc_path.relative_to(out_dir))}
+        if trace_plan is not None:
+            trace_path = out_dir / "trace_plan.json"
+            _save_json(trace_path, trace_plan.as_dict())
+            manifest["trace_plan"] = str(trace_path.relative_to(out_dir))
+        else:
+            manifest.pop("trace_plan", None)
+
+        tb_cpp_out = out_dir / "tb" / f"{tb_name}.cpp"
+        tb_sv_out = out_dir / "tb" / f"{tb_name}.sv"
+
+    if has_tb and do_cpp:
         tb_key = f"tb:{tb_name}"
         tb_hash = _module_hash(tb_pyc_path)
         module_hashes[tb_key] = tb_hash
-        tb_unchanged = same_flags and old_hashes.get(tb_key) == tb_hash
+        tb_unchanged = same_tb_flags and old_hashes.get(tb_key) == tb_hash
         if not (tb_unchanged and tb_cpp_out.is_file()):
             pycc_jobs.append(
                 (
@@ -2944,11 +3307,11 @@ def _cmd_build(args: argparse.Namespace) -> int:
                     [str(pycc), str(tb_pyc_path), *pycc_hard_hierarchy_flags, "-cpp", str(tb_cpp_out)],
                 )
             )
-    if do_v:
+    if has_tb and do_v:
         tb_key = f"tb:{tb_name}"
         tb_hash = module_hashes.get(tb_key) or _module_hash(tb_pyc_path)
         module_hashes[tb_key] = tb_hash
-        tb_unchanged = same_flags and old_hashes.get(tb_key) == tb_hash
+        tb_unchanged = same_tb_flags and old_hashes.get(tb_key) == tb_hash
         if not (tb_unchanged and tb_sv_out.is_file()):
             pycc_jobs.append(
                 (
@@ -2958,12 +3321,13 @@ def _cmd_build(args: argparse.Namespace) -> int:
             )
 
     if pycc_jobs:
+        last_pycc_job_names.extend(name for name, _cmd in pycc_jobs)
         with ProcessPoolExecutor(max_workers=jobs) as pool:
             futs = {pool.submit(_run_backend_job, j): j[0] for j in pycc_jobs}
             for fut in as_completed(futs):
                 _ = fut.result()
 
-    if do_cpp:
+    if has_tb and do_cpp:
         cpp_sources = _gather_cpp_sources(device_cpp_root)
         if not cpp_sources:
             raise SystemExit("build(cpp): no generated C++ sources found")
@@ -3038,7 +3402,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
         subprocess.run(["cmake", "--build", str(cmake_build), "-j", str(jobs)], check=True)
         manifest["cpp_executable"] = str(cmake_build / "pyc_tb")
 
-    if do_v:
+    if has_tb and do_v:
         if not tb_sv_out.is_file():
             raise SystemExit(f"build(verilator): missing generated TB SV source: {tb_sv_out}")
         prim_file: Path | None = None
@@ -3118,6 +3482,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
             run_args = list(getattr(args, "run_arg", []) or [])
             subprocess.run([str(vbin), *run_args], cwd=str(out_dir), check=True)
 
+    cached_dut_src = str(cache.get("dut_src", cache.get("design_src", ""))).strip()
+    next_dut_src = str(design_src) if design_src is not None else cached_dut_src
     cache_out = dict(cache)
     cache_out.update(
         {
@@ -3125,9 +3491,28 @@ def _cmd_build(args: argparse.Namespace) -> int:
             "pycc": str(pycc),
             "build_flags": build_flags,
             "build_flags_hash": build_flags_hash,
-            "jit_cache_key": jit_key,
-            "jit_cache_inputs": jit_inputs,
-            "last_pycc_jobs": int(len(pycc_jobs)),
+            "design_cache_key": design_cache_key,
+            "design_cache_inputs": design_cache_inputs,
+            "jit_cache_key": design_cache_key,
+            "jit_cache_inputs": design_cache_inputs,
+            "design_cache_fast_path": bool(design_cache_fast_path),
+            "design_dependency_fingerprint": design_dependency_fingerprint,
+            "param_overrides": list(param_overrides),
+            "split_inputs": bool(split_inputs),
+            "build_mode": str(build_mode),
+            "dut_src": next_dut_src,
+            "design_src": next_dut_src,
+            "tb_src": str(tb_src) if tb_src is not None else "",
+            "device_backend_flags": device_backend_flags,
+            "device_backend_flags_hash": device_backend_flags_hash,
+            "device_cpp_backend_flags": device_cpp_backend_flags,
+            "device_cpp_backend_flags_hash": device_cpp_backend_flags_hash,
+            "device_verilog_backend_flags": device_verilog_backend_flags,
+            "device_verilog_backend_flags_hash": device_verilog_backend_flags_hash,
+            "tb_backend_flags": tb_backend_flags,
+            "tb_backend_flags_hash": tb_backend_flags_hash,
+            "last_pycc_jobs": int(len(last_pycc_job_names)),
+            "last_pycc_job_names": last_pycc_job_names,
         }
     )
     _save_json(cache_path, cache_out)
@@ -3262,7 +3647,23 @@ def main(argv: list[str] | None = None) -> int:
     emit.set_defaults(fn=_cmd_emit)
 
     build = sub.add_parser("build", help="Canonical flow: multi-.pyc emit + parallel pycc + CMake/Verilator.")
-    build.add_argument("python_file", help="Python source defining `@module build(...)` and `@testbench tb(...)`")
+    build.add_argument(
+        "python_file",
+        nargs="?",
+        help="Legacy single Python source defining/importing `@module build(...)` and `@testbench tb(...)`",
+    )
+    build.add_argument(
+        "--dut",
+        dest="dut",
+        default=None,
+        help="DUT Python source defining `@module build(...)`; may be used alone for a DUT-only build.",
+    )
+    build.add_argument("--design", dest="dut", help=argparse.SUPPRESS)
+    build.add_argument(
+        "--tb",
+        default=None,
+        help="Testbench Python source defining `@testbench tb(...)`; may be used alone to reuse cached DUT artifacts.",
+    )
     build.add_argument("--out-dir", required=True, help="Output directory for project artifacts")
     build.add_argument(
         "--param",
